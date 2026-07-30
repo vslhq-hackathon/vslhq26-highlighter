@@ -46,6 +46,7 @@ builder.Services.AddSingleton(provider => SupabaseStorage.FromEnv(
     provider.GetRequiredService<ILogger<SupabaseStorage>>()));
 builder.Services.AddSingleton<EditorRenderer>();
 builder.Services.AddSingleton<EditorExportService>();
+builder.Services.AddSingleton<JobQueue>();
 builder.Services.AddSingleton<PipelineJobService>();
 builder.Services.AddSingleton<SourceTitleService>();
 builder.Services.AddSingleton<MediaCleanupScheduler>();

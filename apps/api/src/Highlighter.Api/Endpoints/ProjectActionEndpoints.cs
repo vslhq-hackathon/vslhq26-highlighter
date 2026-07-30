@@ -20,10 +20,25 @@ public static class ProjectActionEndpoints
 
         group.MapPost("/{id:guid}/cancel",
             async (Guid id, bool? force, ClaimsPrincipal user, SupabaseDb db, PipelineJobService jobs,
-                CancellationToken ct) =>
+                JobQueue queue, CancellationToken ct) =>
             {
                 var uid = AuthHelpers.Uid(user);
                 var job = jobs.ActiveForProject(id);
+
+                // A remote worker owns this project's job: cooperative 'stopping'
+                // write as usual, plus (on force) the cancel_requested flag its
+                // wrapper polls — the remote analogue of ForceKillAsync.
+                if (job is null && await queue.ActiveForProjectAsync(id, ct) is { } remote)
+                {
+                    var stopping = await db.PatchProjectGuardedAsync(id, ["created", "ingesting"],
+                        new JsonObject { ["status"] = "stopping" }, uid, ct);
+                    if (stopping is null && await db.GetProjectStatusAsync(id, uid, ct) is null)
+                        return NotFound(id);
+                    var flagged = force == true && await queue.RequestCancelAsync(remote.Id, ct);
+                    var remoteStatus = await db.GetProjectStatusAsync(id, uid, ct) ?? "stopping";
+                    return Results.Accepted($"/api/projects/{id}",
+                        new CancelResultDto(id, remoteStatus, remote.Id, flagged));
+                }
 
                 // Force-cancel with no tracked process: either the worker is an
                 // orphan of a previous API instance (it still polls the row and

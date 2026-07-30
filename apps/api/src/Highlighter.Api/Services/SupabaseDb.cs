@@ -245,6 +245,24 @@ public sealed class SupabaseDb
         return slash >= 0 && int.TryParse(raw![(slash + 1)..], out var total) ? total : 0;
     }
 
+    // ---- generic rows (pipeline_jobs) ----
+
+    public async Task<JsonObject> InsertRowAsync(string table, JsonObject row, CancellationToken ct = default)
+    {
+        var body = await SendAsync(HttpMethod.Post, table, "select=*", row, "return=representation", ct);
+        return FirstOrNull(AsArray(body, $"POST {table}"))
+            ?? throw new PostgrestException($"POST {table}", null, "insert returned no row");
+    }
+
+    /// <summary>PATCH rows matching the query; returns the updated rows (empty
+    /// when the filter — including any status guard — matched nothing).</summary>
+    public async Task<JsonArray> PatchRowsAsync(
+        string table, string query, JsonObject patch, CancellationToken ct = default)
+    {
+        var body = await SendAsync(HttpMethod.Patch, table, query, patch, "return=representation", ct);
+        return AsArray(body, $"PATCH {table}");
+    }
+
     // ---- request core ----
 
     public async Task<JsonArray> GetArrayAsync(string table, string query, CancellationToken ct = default)

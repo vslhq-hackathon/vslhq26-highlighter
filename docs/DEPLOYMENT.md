@@ -1,23 +1,42 @@
 # Deploying Highlighter to Azure
 
-Two containers on Azure Container Apps; Supabase (Postgres + Auth + Storage)
-stays external, exactly as in local dev.
+Azure Container Apps end to end; Supabase (Postgres + Auth + Storage) stays
+external, exactly as in local dev.
 
 ```
-Browser ──HTTPS──▶ highlighter-web  (Blazor Server, sticky sessions)
+Browser ──HTTPS──▶ highlighter-web    (Blazor Server, sticky sessions, 1–3 replicas)
                        │ server-to-server
                        ▼
-                   highlighter-api  (Minimal API; spawns the pipeline worker
-                       │             as a subprocess inside the same container)
+                   highlighter-api    (Minimal API, 1–3 replicas on HTTP load)
+                       │ enqueue ingest        │ light verbs (revise, publish,
+                       ▼                       │ exports) run as subprocesses
+                pipeline-jobs queue            ▼
+                 (Azure Storage) ──KEDA──▶ highlighter-worker (Container Apps
+                       ▲                    Job: one execution per ingest run,
+                       │ state: pipeline_jobs table    0–10 in parallel)
                        ▼
                    Supabase / Azure OpenAI / Azure AI Speech / Deepgram / …
 ```
 
-The API image bundles everything a pipeline run needs: the ASP.NET API, the
-`highlighter` worker CLI, ffmpeg/ffprobe, yt-dlp, streamlink, fonts for
-caption rasterization, and the Python shots-sidecar sources. TransNetV2/torch
-is **not** installed by default (it adds multiple GB); scene-cut detection is
-skipped gracefully, or opt in with `--build-arg INSTALL_SHOTS=true`.
+Ingest — the heavy highlight-detection pipeline (capture, transcribe, TransNet
+scene cuts, LLM scoring, rendering) — is dispatched through an Azure Storage
+queue: the API writes a `pipeline_jobs` row (the durable state record) and
+enqueues a message; KEDA scales the `highlighter-worker` job from 0 to one
+execution per queued run. Workers and the API share the `outputs` Azure Files
+mount, so the `/media` mirror, revise/publish gating, and per-job log files
+keep working exactly as on a single machine. Cancellation stays cooperative
+through the DB (`projects.status = 'stopping'`), with a `cancel_requested`
+flag on the job row as the force-kill path.
+
+Three images, all built from the repo root:
+
+- `docker/api.Dockerfile` — ASP.NET API + worker CLI + ffmpeg/yt-dlp/streamlink
+  for the light verbs it still runs in-container. TransNetV2/torch is **not**
+  installed (ingest doesn't run here in prod).
+- `docker/worker.Dockerfile` — the queue worker (`highlighter run-queued`).
+  Same media tooling, **with** TransNetV2 on CPU-only torch: TransNet operates
+  on 48×27 frames, so no GPU is needed.
+- `docker/web.Dockerfile` — the Blazor Server studio.
 
 ## Local parity
 
@@ -46,10 +65,12 @@ No Azure credentials are involved; CI runs fine before the Azure account exists.
    token; Azure accepts it because of a federated credential you register
    once (below). No password or long-lived service-principal secret ever
    lives in GitHub.
-2. **Build and push** `highlighter-api` and `highlighter-web` images to Azure
-   Container Registry, tagged with the commit SHA (plus `latest`). The two
-   images build in parallel matrix jobs.
-3. **Roll the apps**: `az containerapp update --image …:<sha>` on each app.
+2. **Build and push** `highlighter-api`, `highlighter-web`, and
+   `highlighter-worker` images to Azure Container Registry, tagged with the
+   commit SHA (plus `latest`). The images build in parallel matrix jobs.
+3. **Roll the apps**: `az containerapp update --image …:<sha>` on each app and
+   `az containerapp job update` on the worker (running executions finish on
+   the old image; new ones start on the new).
    Container Apps creates a new *revision*, waits for it to become healthy
    (the API has a `/healthz` liveness probe), then shifts traffic and drains
    the old revision — an automatic, zero-downtime blue/green per deploy.
@@ -80,9 +101,12 @@ az deployment group create -g highlighter-rg -f infra/main.bicep \
 `infra/main.bicep` creates: Log Analytics, the Container Apps environment, an
 ACR (Basic), a storage account with two Azure Files shares (`outputs` for
 renders + the `/media` mirror, `dpkeys` for the web app's DataProtection key
-ring), a user-assigned identity with AcrPull, and the two container apps. The
-apps start on a public placeholder image; the first `deploy.yml` run replaces
-it.
+ring) and the `pipeline-jobs` queue, a user-assigned identity with AcrPull,
+the two container apps, and the event-driven worker job. Everything starts on
+a public placeholder image; the first `deploy.yml` run replaces it.
+
+Also apply `supabase/migrations/` to the Supabase project — distributed
+dispatch needs the `pipeline_jobs` table (202608010014).
 
 To rotate or add a secret later, re-run the deployment with the updated
 `secrets.json` (or `az containerapp secret set` + a new revision).
@@ -136,18 +160,27 @@ approval gate between merge and rollout.
 Add `https://highlighter-web.<env-default-domain>` to the Supabase project's
 auth redirect allow-list if you use email confirmation links.
 
-## Deliberate minimalism (and what scaling out would take)
+## Design notes (and the remaining sharp edges)
 
-- **One replica each.** Pipeline jobs live in the API's process memory and
-  renders land on the mounted `outputs` share; scaling the API out needs a
-  real job queue (e.g. moving job state to Postgres and workers to Container
-  Apps Jobs). The web app is Blazor Server (stateful circuits) — sticky
-  sessions are already configured for the day `maxReplicas` goes up.
-- **Worker runs inside the API container**, exactly like local dev — the API
-  spawns `dotnet /app/worker/highlighter.dll`. The container gets 2 vCPU /
-  4 GiB; raise it in `infra/main.bicep` if renders need more.
-- **No TransNetV2 by default.** Build the API image with
-  `INSTALL_SHOTS=true` (and consider a dedicated-workload profile) when scene
-  cuts matter in prod.
+- **Ingest scales horizontally, light verbs don't need to.** Each queued
+  ingest gets its own 4 vCPU / 8 GiB job execution (up to 10 in parallel —
+  `maxExecutions` in `infra/main.bicep`). Revise/publish/thumbnails/exports
+  are quick enough to stay as subprocesses of the API replica that took the
+  request; their state is mirrored to `pipeline_jobs` so `GET /api/jobs/*`
+  works from any replica, but a *force*-kill for them only lands on the
+  replica that owns the process (cooperative cancel via the DB always works).
+- **The shared `outputs` Azure Files mount is the contract** between API and
+  workers: `/media` mirror, `project.json` gating, and the per-job log files
+  the API tails for `/logs` and `/logs/stream`.
+- **CPU-only workers.** TransNetV2 runs on 48×27 frames; the smallest Azure
+  GPU tier (serverless T4) is quota-gated and ~5–10× the cost for no
+  measurable gain here. If that changes: switch `device` in
+  `pipeline/highlighter_pipeline/shots.py`, use a CUDA torch wheel in
+  `docker/worker.Dockerfile`, and put the job on a GPU workload profile.
+- **No Redis.** The storage queue carries the work signal; Supabase Postgres
+  is the state store and cancellation channel. A second stateful service
+  would buy nothing at this scale.
+- **Blazor Server web app** keeps sticky sessions (stateful circuits) while
+  scaling 1–3.
 - **Secrets are Container Apps secrets.** A later step up is Azure Key Vault
   references, which the bicep can adopt without touching app code.

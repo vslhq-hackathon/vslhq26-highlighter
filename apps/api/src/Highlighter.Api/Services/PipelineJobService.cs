@@ -11,7 +11,8 @@ namespace Highlighter.Api.Services;
 /// design: project rows stay authoritative, cooperative cancel survives an API
 /// restart (the worker polls the DB), and the per-job log files are the durable
 /// record. One active job per project; cleanup drains are globally single-flight.</summary>
-public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger<PipelineJobService> log)
+public sealed class PipelineJobService(
+    RepoLayout layout, SupabaseDb db, JobQueue queue, ILogger<PipelineJobService> log)
 {
     private const int MaxTerminalJobs = 200;
     // A single demo machine can't survive unbounded parallel ffmpeg/yt-dlp work.
@@ -76,6 +77,7 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
         try
         {
             Launch(job, command, workerArgs);
+            queue.MirrorStart(job);
             log.LogInformation("Job {JobId} ({Kind}) started for project {ProjectId}: {Command}",
                 id, kind, projectId, string.Join(' ', display));
         }
@@ -121,6 +123,7 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
             $"command: {string.Join(' ', displayArgv)} (in-process)",
         ]);
         job.MarkRunning();
+        queue.MirrorStart(job);
         log.LogInformation("Job {JobId} ({Kind}) started in-process for project {ProjectId}",
             id, kind, projectId);
 
@@ -149,6 +152,7 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
             finally
             {
                 cts.Dispose();
+                queue.MirrorEnd(job);
                 Evict();
             }
         });
@@ -400,6 +404,7 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
         finally
         {
             process.Dispose();
+            queue.MirrorEnd(job);
             Evict();
         }
         await WriteAgentChatCompletionAsync(job);

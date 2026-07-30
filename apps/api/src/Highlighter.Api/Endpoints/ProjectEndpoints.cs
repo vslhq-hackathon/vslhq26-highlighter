@@ -18,7 +18,7 @@ public static class ProjectEndpoints
 
         group.MapPost("/",
             async (CreateProjectRequest request, ClaimsPrincipal user, SupabaseDb db,
-                PipelineJobService jobs, SourceTitleService titles,
+                PipelineJobService jobs, JobQueue queue, SourceTitleService titles,
                 ILogger<PipelineJobService> log, CancellationToken ct) =>
             {
                 if (Validate(request) is { } invalid) return invalid;
@@ -43,11 +43,13 @@ public static class ProjectEndpoints
 
                 try
                 {
-                    jobs.Start("ingest", projectId,
-                        WorkerArgs.Ingest(projectId, request,
-                            llmConcurrency: EnvInt("LLM_CONCURRENCY"),
-                            transcribeConcurrency: EnvInt("TRANSCRIBE_CONCURRENCY")),
-                        jobId, AuthHelpers.Uid(user));
+                    var argv = WorkerArgs.Ingest(projectId, request,
+                        llmConcurrency: EnvInt("LLM_CONCURRENCY"),
+                        transcribeConcurrency: EnvInt("TRANSCRIBE_CONCURRENCY"));
+                    if (queue.Enabled)
+                        await queue.StartIngestAsync(jobId, projectId, argv, AuthHelpers.Uid(user), ct);
+                    else
+                        jobs.Start("ingest", projectId, argv, jobId, AuthHelpers.Uid(user));
                 }
                 catch (WorkerUnavailableException exception)
                 {
@@ -83,7 +85,7 @@ public static class ProjectEndpoints
 
         group.MapDelete("/{id:guid}",
             async (Guid id, bool? force, ClaimsPrincipal user, SupabaseDb db, PipelineJobService jobs,
-                RepoLayout layout, MediaCleanupScheduler cleanup, SupabaseStorage storage,
+                JobQueue queue, RepoLayout layout, MediaCleanupScheduler cleanup, SupabaseStorage storage,
                 ILogger<PipelineJobService> log, CancellationToken ct) =>
             {
                 var uid = AuthHelpers.Uid(user);
@@ -96,6 +98,16 @@ public static class ProjectEndpoints
                         return Problem(409, "Project has an active job",
                             $"Job {active.Id} ({active.Kind}) is running; cancel it first or pass ?force=true");
                     await jobs.ForceKillAsync(active);
+                }
+                else if (await queue.ActiveForProjectAsync(id, ct) is { } remote)
+                {
+                    if (force != true)
+                        return Problem(409, "Project has an active job",
+                            $"Job {remote.Id} ({remote.Kind}) is running; cancel it first or pass ?force=true");
+                    // Remote worker: flag its row; the wrapper SIGTERMs within its
+                    // supervise period. The row delete below cascades this job row,
+                    // which the wrapper tolerates.
+                    await queue.RequestCancelAsync(remote.Id, ct);
                 }
 
                 if (!await db.DeleteProjectAsync(id, uid, ct)) return NotFound(id);
@@ -152,26 +164,26 @@ public static class ProjectEndpoints
             .WithName("DeleteClip");
 
         group.MapGet("/",
-            async (ClaimsPrincipal user, SupabaseDb db, PipelineJobService jobs, int? limit,
-                CancellationToken ct) =>
+            async (ClaimsPrincipal user, SupabaseDb db, PipelineJobService jobs, JobQueue queue,
+                int? limit, CancellationToken ct) =>
             {
                 var rows = await db.ListProjectsAsync(
                     Math.Clamp(limit ?? 100, 1, 500), AuthHelpers.Uid(user), ct);
                 return Results.Ok(rows.OfType<JsonObject>()
-                    .Select(row => ProjectShaper.Summary(row, ActiveJobId(jobs, row)))
+                    .Select(row => ProjectShaper.Summary(row, ActiveJobId(jobs, queue, row)))
                     .ToList());
             })
             .WithName("ListProjects");
 
         group.MapGet("/{id:guid}",
             async (Guid id, ClaimsPrincipal user, SupabaseDb db, RepoLayout layout,
-                PipelineJobService jobs, CancellationToken ct) =>
+                PipelineJobService jobs, JobQueue queue, CancellationToken ct) =>
             {
                 var row = await db.GetProjectDetailAsync(id, AuthHelpers.Uid(user), ct);
                 return row is null
                     ? NotFound(id)
                     : Results.Ok(ProjectShaper.Detail(
-                        row, layout.HasLocalMirror(id), jobs.ActiveJobIdForProject(id)));
+                        row, layout.HasLocalMirror(id), ActiveJobId(jobs, queue, row)));
             })
             .WithName("GetProject");
 
@@ -275,10 +287,19 @@ public static class ProjectEndpoints
         },
     };
 
-    private static string? ActiveJobId(PipelineJobService jobs, JsonObject row) =>
-        Guid.TryParse(row["id"]?.GetValue<string>(), out var id)
-            ? jobs.ActiveJobIdForProject(id)
+    /// <summary>Registry first; with distributed dispatch the registry only knows
+    /// this replica's jobs, so an active-looking row falls back to instance_id —
+    /// the job id POST / pre-assigned before enqueueing.</summary>
+    private static string? ActiveJobId(PipelineJobService jobs, JobQueue queue, JsonObject row)
+    {
+        if (Guid.TryParse(row["id"]?.GetValue<string>(), out var id)
+            && jobs.ActiveJobIdForProject(id) is { } tracked)
+            return tracked;
+        return queue.Enabled
+               && row["status"]?.GetValue<string>() is "created" or "ingesting" or "stopping"
+            ? row["instance_id"]?.GetValue<string>()
             : null;
+    }
 
     /// <summary>Concurrency knobs live in .env; passing them as explicit worker
     /// flags keeps API-triggered runs identical to manual CLI runs.</summary>

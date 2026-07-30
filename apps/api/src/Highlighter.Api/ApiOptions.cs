@@ -29,6 +29,13 @@ public sealed class PipelineOptions
     /// <summary>Directory for per-job worker logs. Empty → {repo}/outputs/api/jobs.</summary>
     public string JobLogRoot { get; set; } = "";
 
+    /// <summary>When true, ingest jobs are dispatched to remote Container Apps
+    /// Job workers via the Azure Storage queue (JOBS_QUEUE_CONNECTION /
+    /// JOBS_QUEUE_NAME env vars) instead of a local subprocess, and all jobs are
+    /// mirrored to the pipeline_jobs table so any API replica can answer job
+    /// reads. False (the default) keeps the single-machine dev behavior.</summary>
+    public bool DistributedIngest { get; set; }
+
     public int CleanupIntervalMinutes { get; set; } = 15;
 
     public int CleanupLimit { get; set; } = 50;

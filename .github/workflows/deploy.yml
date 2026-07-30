@@ -1,6 +1,6 @@
-# CD: on every push to main (after CI passes on the merge), build the two
-# images, push them to Azure Container Registry, and roll the Container Apps to
-# the new revision. Authentication is OIDC — GitHub mints a short-lived token
+# CD: on every push to main (after CI passes on the merge), build the three
+# images, push them to Azure Container Registry, and roll the Container Apps
+# (and the worker job) to the new revision. Authentication is OIDC — GitHub mints a short-lived token
 # that Azure trusts via a federated credential; no long-lived secret is stored.
 #
 # Required repository configuration (Settings → Secrets and variables → Actions):
@@ -29,7 +29,7 @@ jobs:
     environment: production
     strategy:
       matrix:
-        image: [api, web]
+        image: [api, web, worker]
     steps:
       - uses: actions/checkout@v4
 
@@ -79,6 +79,12 @@ jobs:
             --name highlighter-web \
             --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
             --image ${{ vars.ACR_NAME }}.azurecr.io/highlighter-web:${{ github.sha }}
+          # Jobs have no revisions to drain: running executions finish on the
+          # old image, new executions start on the new one.
+          az containerapp job update \
+            --name highlighter-worker \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image ${{ vars.ACR_NAME }}.azurecr.io/highlighter-worker:${{ github.sha }}
 
       - name: Smoke check
         run: |

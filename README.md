@@ -1,6 +1,6 @@
 # Highlighter
 
-**Team:** Highlighter — Anthony Cui (@AnthonyCui7)
+**Team:** Highlighter — Anthony Cui (@AnthonyCui7), Theo Oltean (@TheoOltean)
 **Category:** AI Agents (primary) · Azure OpenAI Models (secondary)
 
 ## What it does
@@ -51,8 +51,10 @@ create an account, and paste a video URL.
 
 The app is containerized (`docker/`, `docker-compose.yml`) and deploys to
 Azure Container Apps with GitHub Actions CI/CD (`.github/workflows/`) and
-Bicep infrastructure (`infra/main.bicep`). See `docs/DEPLOYMENT.md` for the
-full pipeline description and one-time Azure setup.
+Bicep infrastructure (`infra/main.bicep`): the API and web apps scale on
+traffic, and each ingest run gets its own Container Apps Job worker via an
+Azure Storage queue. See `docs/DEPLOYMENT.md` for the architecture and
+one-time Azure setup.
 
 ```bash
 cp .env.example .env

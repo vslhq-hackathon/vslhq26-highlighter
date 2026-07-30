@@ -1,3 +1,4 @@
+using Highlighter.Cli;
 using Highlighter.Pipeline;
 
 const string usage =
@@ -13,6 +14,7 @@ const string usage =
       reformat  Render a square center-crop copy of a clip (optionally captioned).
       reclip    Render a clip from a project's archived source video in S3.
       cleanup   Delete media objects referenced by pending media_cleanup_jobs rows.
+      run-queued  Drain pipeline jobs from the Azure Storage queue (container worker mode).
       db-smoke  Insert a smoke-test project into Supabase.
     """;
 
@@ -61,6 +63,9 @@ try
             break;
         case "cleanup":
             Cleanup.Main(rest);
+            break;
+        case "run-queued":
+            Environment.Exit(RunQueued.Main().GetAwaiter().GetResult());
             break;
         case "db-smoke":
             DbSmoke.Main();
