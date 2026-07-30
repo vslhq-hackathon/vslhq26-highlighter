@@ -9,6 +9,12 @@ public static class HealthEndpoints
 {
     public static void MapHealthEndpoints(this IEndpointRouteBuilder app)
     {
+        // Liveness only — /healthz gates on Supabase reachability, which would
+        // make an orchestrator restart a healthy process during an upstream
+        // blip. Container probes point here; /healthz stays the deep check.
+        app.MapGet("/livez", () => Results.Ok(new { status = "alive" }))
+            .WithName("GetLiveness");
+
         app.MapGet("/healthz",
             async (RepoLayout layout, SupabaseDb db, PipelineJobService jobs, CancellationToken ct) =>
             {

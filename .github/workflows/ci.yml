@@ -1,0 +1,44 @@
+# CI: build + test on every push and pull request. No cloud credentials needed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Test pipeline worker
+        run: dotnet test pipeline-dotnet/Highlighter.slnx --nologo
+
+      - name: Test API
+        run: dotnet test apps/api/Highlighter.Api.slnx --nologo
+
+      - name: Build web
+        run: dotnet build apps/web --nologo
+
+  # PRs also prove the images assemble; pushing happens only from deploy.yml.
+  docker:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [api, web]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.image }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/${{ matrix.image }}.Dockerfile
+          push: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max

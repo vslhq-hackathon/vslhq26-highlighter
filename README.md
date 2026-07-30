@@ -47,6 +47,18 @@ cd apps/web && dotnet run                                  # http://localhost:50
 Apply `supabase/migrations/` to your Supabase project, open the web app,
 create an account, and paste a video URL.
 
+## Deployment
+
+The app is containerized (`docker/`, `docker-compose.yml`) and deploys to
+Azure Container Apps with GitHub Actions CI/CD (`.github/workflows/`) and
+Bicep infrastructure (`infra/main.bicep`). See `docs/DEPLOYMENT.md` for the
+full pipeline description and one-time Azure setup.
+
+```bash
+cp .env.example .env
+docker compose up --build    # web on :5097, api on :5199
+```
+
 ## Demo
 
 `./demo/demo.mov`
