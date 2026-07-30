@@ -16,7 +16,7 @@ public class ReframeTests
     }
 
     [Fact]
-    public void ValidateFallsBackToCenteredFraming()
+    public void ValidateFallsBackToWideFraming()
     {
         foreach (var raw in new JsonNode?[]
                  {
@@ -30,8 +30,47 @@ public class ReframeTests
         {
             var keyframes = Reframe.ValidateKeyframes(raw, 30.0);
             Assert.Single(keyframes);
-            AssertKeyframe(keyframes[0], 0.0, 0.5, false);
+            AssertKeyframe(keyframes[0], 0.0, 0.5, true);
         }
+    }
+
+    [Fact]
+    public void SpanWordsTextJoinsOverlappingWordsInOrder()
+    {
+        var words = new JsonArray
+        {
+            new JsonObject { ["punctuated_word"] = "So", ["start"] = 0.1, ["end"] = 0.3 },
+            new JsonObject { ["punctuated_word"] = "like,", ["start"] = 0.3, ["end"] = 0.6 },
+            new JsonObject { ["word"] = "name?", ["start"] = 4.8, ["end"] = 5.2 },
+            new JsonObject { ["punctuated_word"] = "Ariana.", ["start"] = 6.0, ["end"] = 6.4 },
+        };
+        // Word ending exactly at spanStart is excluded; overlap at the end is kept.
+        Assert.Equal("like, name?", Reframe.SpanWordsText(words, 0.3, 5.0));
+        Assert.Equal("Ariana.", Reframe.SpanWordsText(words, 5.5, 10.0));
+        Assert.Equal("", Reframe.SpanWordsText(words, 20.0, 25.0));
+        Assert.Equal("", Reframe.SpanWordsText(null, 0.0, 5.0));
+    }
+
+    [Fact]
+    public void SpanWordsTextSkipsUntimedWordsAndCapsLength()
+    {
+        var words = new JsonArray
+        {
+            new JsonObject { ["punctuated_word"] = "ghost" },
+            new JsonObject { ["punctuated_word"] = "kept", ["start"] = 1.0, ["end"] = 1.2 },
+        };
+        for (var i = 0; i < 400; i++)
+        {
+            words.Add(new JsonObject
+            {
+                ["punctuated_word"] = "padding",
+                ["start"] = 2.0 + i * 0.01,
+                ["end"] = 2.1 + i * 0.01,
+            });
+        }
+        var text = Reframe.SpanWordsText(words, 0.0, 30.0);
+        Assert.StartsWith("kept padding", text);
+        Assert.True(text.Length <= 1200);
     }
 
     [Fact]

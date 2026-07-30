@@ -70,18 +70,18 @@ public static class Transcribe
             ["locales"] = new JsonArray(locale),
         });
 
-        string payload;
-        try
+        var audioBytes = File.ReadAllBytes(audioPath);
+        HttpRequestMessage BuildRequest()
         {
-            using var content = new MultipartFormDataContent();
+            // A fresh message per attempt: HttpClient disposes sent content.
+            var content = new MultipartFormDataContent();
             var definitionPart = new StringContent(definition);
             definitionPart.Headers.ContentType = new MediaTypeHeaderValue("application/json");
             content.Add(definitionPart, "definition");
-            var audioPart = new ByteArrayContent(File.ReadAllBytes(audioPath));
+            var audioPart = new ByteArrayContent(audioBytes);
             audioPart.Headers.ContentType = new MediaTypeHeaderValue("audio/wav");
             content.Add(audioPart, "audio", Path.GetFileName(audioPath));
-
-            using var request = new HttpRequestMessage(
+            var request = new HttpRequestMessage(
                 HttpMethod.Post,
                 $"{baseUrl}/speechtotext/transcriptions:transcribe"
                 + $"?api-version={AZURE_SPEECH_API_VERSION}")
@@ -89,12 +89,33 @@ public static class Transcribe
                 Content = content,
             };
             request.Headers.TryAddWithoutValidation("Ocp-Apim-Subscription-Key", key);
+            return request;
+        }
 
+        string payload;
+        try
+        {
+            using var request = BuildRequest();
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
             using var response = Http.Send(request, HttpCompletionOption.ResponseContentRead, cts.Token);
             var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            if (!response.IsSuccessStatusCode)
+            if ((int)response.StatusCode == 429)
+            {
+                // Throttled: one Retry-After-honoring retry keeps the chunk on
+                // Azure (word-timing quality) instead of tipping to Deepgram.
+                var wait = ChatCompletionsClient.RetryAfterSeconds(response) ?? 2.0;
+                Thread.Sleep(TimeSpan.FromSeconds(Math.Min(wait, 30.0)));
+                using var retry = BuildRequest();
+                using var cts2 = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+                using var second = Http.Send(retry, HttpCompletionOption.ResponseContentRead, cts2.Token);
+                body = second.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                if (!second.IsSuccessStatusCode)
+                    throw new PipelineError($"Azure Speech request failed: {body}");
+            }
+            else if (!response.IsSuccessStatusCode)
+            {
                 throw new PipelineError($"Azure Speech request failed: {body}");
+            }
             payload = body;
         }
         catch (HttpRequestException exc)

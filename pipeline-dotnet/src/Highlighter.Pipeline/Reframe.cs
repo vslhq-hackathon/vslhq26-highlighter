@@ -6,14 +6,14 @@ namespace Highlighter.Pipeline;
 ///
 /// Auto-reframe rendered short-form clips to a 9:16 vertical.
 ///
-/// One framing call per clip decides where the sharp region sits: the model
-/// sees frames sampled every few seconds (plus one just after each scene cut,
-/// and the clip's opening frame), the scene-cut timings, and the clip's
-/// editorial context, and returns a small set of horizontal crop centers — a
-/// starting framing, then a new center whenever the speaker or action moves. Spans whose
-/// information doesn't fit a square (split layouts, a board or screen beside a
-/// speaker, wide action) are flagged wide and show the whole 16:9 frame
-/// fitted to the canvas width instead. Rendering is deterministic: a full-height
+/// One framing call PER SAMPLED FRAME decides where the sharp region sits for
+/// the span that frame governs (until the next sampled frame): the model sees
+/// that one frame plus the transcript words spoken in its span, and returns
+/// either a horizontal 1:1 crop center or wide. Frames are sampled at the clip
+/// start, every few seconds, and just after each scene cut. Spans whose words
+/// and action don't fit one square (split layouts with both sides active, wide
+/// action, full-frame graphics) go wide and show the whole 16:9 frame fitted
+/// to the canvas width instead. Rendering is deterministic: a full-height
 /// square crop at those centers (or the fitted wide frame) fills the width of a
 /// 720x1280 canvas, with a blurred, darkened zoom-fill of the same frame above
 /// and below. Framing is static between keyframes — hard cuts, no tracking.</summary>
@@ -28,112 +28,202 @@ public static class Reframe
     // A periodic frame this close to a cut frame shows the same moment twice.
     public const double PERIODIC_FRAME_MIN_GAP_SECONDS = 2.0;
     // Crop moves closer together than this read as jitter, not reframing.
+    // The center dead-band absorbs per-frame disagreement: independent framing
+    // calls on a static subject answer within a few percent of each other, and
+    // a hard cut that shifts the crop under ~8% of the width reads as a glitch.
+    // Real reframes (pane or speaker switches) move far more.
     public const double MIN_KEYFRAME_SPACING_SECONDS = 1.5;
-    public const double MIN_CENTER_DELTA = 0.03;
+    public const double MIN_CENTER_DELTA = 0.08;
     // Framing is a perceptual where's-the-subject call; on the Gemini link of
     // the chain, deep reasoning only adds latency per clip. (The Azure
     // deployment always runs at its own AZURE_REASONING_EFFORT.)
     public const string REFRAME_REASONING_EFFORT = "low";
+    // Per-frame framing calls in flight per clip — pure API latency, no CPU.
+    public const int FRAME_CALL_CONCURRENCY = 6;
+    // Enough transcript for any span; a runaway span can't bloat the prompt.
+    private const int MAX_SPAN_WORDS_CHARS = 1200;
 
     public const string REFRAME_SYSTEM_PROMPT =
         """
-        You are the framing director converting a 16:9 highlight clip into a vertical
-        short. The vertical canvas shows a full-height square crop of the source at
-        full canvas width; a blurred fill covers the rest. Spans flagged wide show the
-        whole 16:9 frame fitted to the canvas width instead — plenty of short-form
-        video runs 16:9 inside a vertical canvas. Your decision, over time, is where
-        the square sits — or that a span stays wide.
+        You frame one moment of a 16:9 video for a vertical (9:16) short. The render
+        overlays a sharp region on a blurred fill of the same frame. Two choices:
+        - Square crop: a full-height 1:1 crop, placed by center_x (fraction of frame
+          width: 0 = left edge, 0.5 = middle, 1 = right). Pick the square that holds
+          whoever or whatever produces the words and action in this span's
+          transcript — the speaker's face or pane, the demo, the play.
+        - Wide (wide = true): the whole 16:9 frame fitted into the vertical with
+          blurred padding. This is the fallback: use it only when no single square
+          captures most of the span — two far-apart people both active, wide action,
+          full-frame graphics.
 
-        You get frames sampled every few seconds and just after each shot change (each
-        labeled with its timestamp in seconds from the start of the clip), the clip's
-        scene-cut timings, and editorial context about what happens in it. Return crop
-        keyframes: a starting keyframe at 0 seconds, then a new one ONLY when the
-        framing should change — typically because the shot changed. center_x is the
-        horizontal center of the square as a fraction of the source width (0 = left
-        edge, 0.5 = middle, 1 = right edge).
-
-        Rules:
-        - Frame the story, not just the face. When a board, screen, gameplay, chart,
-          or demo carries the moment, it belongs in frame: crop to it, or go wide when
-          it and the speaker cannot share one square.
-        - Crop only when a square genuinely holds everything that matters for the
-          span — one talking head, one clear subject. If the frame's information does
-          not fit a square (side-by-side layouts, a speaker plus what they are
-          reacting to, wide action, full-frame graphics), keep the span wide. When in
-          doubt, wide beats a crop that hides what the clip is about.
-        - Framing is static between keyframes and jumps at each keyframe. Never try to
-          track or slide — a few well-placed static framings beat many small moves.
-          When one framing covers the whole clip, return just the starting keyframe.
-        - Keyframes belong on shot changes (the scene-cut timings) unless the subject
-          clearly moves within a shot.
-        - Prefer one wide span over rapid crop-jumping between two speakers trading
-          short lines.
+        Judge with the transcript: would a viewer seeing only your square follow every
+        word and action in this span? If yes, crop; if no square works, go wide. Many
+        frames are small panes on a dead background (stream layouts): crop to the
+        active pane — wide only shrinks it further. Ignore chat overlays, tickers, and
+        empty margins; center on faces, not on a pane's geometric center.
 
         Return only JSON matching the schema.
         """;
 
-    private const string REFRAME_RESPONSE_SCHEMA_JSON =
+    private const string FRAME_RESPONSE_SCHEMA_JSON =
         """
         {
           "type": "object",
           "properties": {
-            "keyframes": {
-              "type": "array",
-              "description": "Crop positions in clip order; the first starts at 0 seconds.",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "start_seconds": {
-                    "type": "number",
-                    "description": "Clip-relative time this framing takes effect."
-                  },
-                  "center_x": {
-                    "type": "number",
-                    "description": "Horizontal center of the square crop as a fraction of source width. Use 0.5 when wide is true.",
-                    "minimum": 0,
-                    "maximum": 1
-                  },
-                  "wide": {
-                    "type": "boolean",
-                    "description": "True when this span shows the whole 16:9 frame fitted to the canvas width — the right call whenever the frame's information does not fit one square."
-                  }
-                },
-                "required": ["start_seconds", "center_x", "wide"],
-                "additionalProperties": false
-              }
+            "center_x": {
+              "type": "number",
+              "description": "Horizontal center of the 1:1 crop as a fraction of frame width. Use 0.5 when wide is true.",
+              "minimum": 0,
+              "maximum": 1
             },
-            "notes": {
-              "type": "string",
-              "description": "One line on the framing choices."
+            "wide": {
+              "type": "boolean",
+              "description": "True to show the whole 16:9 frame fitted with blurred padding instead of a square crop."
             }
           },
-          "required": ["keyframes", "notes"],
+          "required": ["center_x", "wide"],
           "additionalProperties": false
         }
         """;
 
-    public static JsonObject ReframeResponseSchema() =>
-        JsonUtil.ParseObject(REFRAME_RESPONSE_SCHEMA_JSON);
+    public static JsonObject FrameResponseSchema() =>
+        JsonUtil.ParseObject(FRAME_RESPONSE_SCHEMA_JSON);
 
-    /// <summary>One framing call deciding the crop keyframes for a rendered clip.
+    /// <summary>One framing call per sampled frame, deciding the crop keyframes
+    /// for a rendered clip.
     ///
-    /// sceneCuts are clip-relative seconds. Returns {keyframes, notes, model}
-    /// with keyframes validated (first at 0, sorted, de-jittered); throws on
-    /// failure — the caller keeps the 16:9 clip.</summary>
+    /// sceneCuts are clip-relative seconds; transcriptWords are clip-relative
+    /// {word|punctuated_word, start, end} objects (null → framing runs on the
+    /// images alone). Frame calls run concurrently; a failed frame is skipped
+    /// so the previous framing extends across its span. Returns
+    /// {keyframes, notes, model} with keyframes validated (first at 0, sorted,
+    /// de-jittered); throws when every frame call fails — the caller keeps the
+    /// 16:9 clip.</summary>
     public static JsonObject PlanCropTrack(
         string clipPath,
         double clipDurationSeconds,
         IReadOnlyList<double> sceneCuts,
         string title,
         string description,
-        JsonObject? researchContext = null,
+        JsonArray? transcriptWords = null,
         double frameIntervalSeconds = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS)
     {
         var sampleTimes = SampleTimes(clipDurationSeconds, sceneCuts, frameIntervalSeconds);
-        var cutList = sceneCuts.Count > 0
-            ? string.Join(", ", sceneCuts.Select(cut => Py.F(cut, 1)))
-            : "none detected";
-        var content = new JsonArray
+        var frames = new List<string>(sampleTimes.Count);
+        using (var tmp = new TempDir(prefix: "reframe-"))
+        {
+            for (var index = 0; index < sampleTimes.Count; index++)
+            {
+                var framePath = Path.Combine(tmp.Path, $"frame_{index}.jpg");
+                Render.ExtractThumbnail(
+                    clipPath: clipPath, outputPath: framePath, atSeconds: sampleTimes[index]);
+                frames.Add(Convert.ToBase64String(File.ReadAllBytes(framePath)));
+            }
+        }
+
+        var providers = Providers.EditorProviders(
+            title: "highlighter reframe",
+            openrouterReasoningEffort: REFRAME_REASONING_EFFORT);
+        var results = new JsonObject?[sampleTimes.Count];
+        var servedBy = new ChatProvider?[sampleTimes.Count];
+        using var slots = new SemaphoreSlim(FRAME_CALL_CONCURRENCY);
+        var workers = new List<Task>(sampleTimes.Count);
+        for (var index = 0; index < sampleTimes.Count; index++)
+        {
+            var slot = index;
+            slots.Wait();
+            workers.Add(Task.Run(() =>
+            {
+                try
+                {
+                    var spanStart = sampleTimes[slot];
+                    var spanEnd = slot + 1 < sampleTimes.Count
+                        ? sampleTimes[slot + 1]
+                        : clipDurationSeconds;
+                    var content = FrameContent(
+                        frames[slot], spanStart, spanEnd, clipDurationSeconds,
+                        title, description,
+                        SpanWordsText(transcriptWords, spanStart, spanEnd));
+                    var (framing, provider) = Providers.RunWithFallback(
+                        providers, candidate => RequestFraming(candidate, content));
+                    results[slot] = framing;
+                    servedBy[slot] = provider;
+                }
+                catch (Exception exc)
+                {
+                    Console.WriteLine(
+                        $"Framing call for frame at {Py.F(sampleTimes[slot], 1)}s failed "
+                        + $"(previous framing extends): {exc.Message}");
+                }
+                finally
+                {
+                    slots.Release();
+                }
+            }));
+        }
+        Task.WaitAll(workers.ToArray());
+
+        var rawKeyframes = new JsonArray();
+        for (var index = 0; index < sampleTimes.Count; index++)
+        {
+            if (results[index] is not { } framing) continue;
+            rawKeyframes.Add(new JsonObject
+            {
+                ["start_seconds"] = sampleTimes[index],
+                ["center_x"] = JsonUtil.C(framing["center_x"]),
+                ["wide"] = JsonUtil.Truthy(framing["wide"]),
+            });
+        }
+        if (rawKeyframes.Count == 0)
+            throw new PipelineError("Every per-frame framing call failed");
+
+        var keyframes = new JsonArray();
+        foreach (var keyframe in ValidateKeyframes(rawKeyframes, clipDurationSeconds))
+            keyframes.Add(keyframe);
+        var wideCount = keyframes.Count(k => JsonUtil.Truthy((k as JsonObject)?["wide"]));
+        return new JsonObject
+        {
+            ["keyframes"] = keyframes,
+            ["notes"] = $"per-frame framing: {rawKeyframes.Count}/{sampleTimes.Count} frames "
+                + $"answered, {keyframes.Count - wideCount} crop / {wideCount} wide span(s)",
+            ["model"] = servedBy.FirstOrDefault(p => p is not null)?.Model ?? "",
+        };
+    }
+
+    /// <summary>The transcript line for one frame's span: words overlapping
+    /// [spanStart, spanEnd), joined in order, capped. Empty when no words.</summary>
+    public static string SpanWordsText(JsonArray? words, double spanStart, double spanEnd)
+    {
+        if (words is null) return "";
+        var parts = new List<string>();
+        var length = 0;
+        foreach (var node in words)
+        {
+            if (node is not JsonObject word) continue;
+            if (!JsonUtil.TryDouble(word["start"], out var start)
+                || !JsonUtil.TryDouble(word["end"], out var end))
+                continue;
+            if (end <= spanStart || start >= spanEnd) continue;
+            var text = JsonUtil.StrOrNull(word["punctuated_word"])
+                ?? JsonUtil.StrOrNull(word["word"]) ?? "";
+            if (text.Length == 0) continue;
+            if (length + text.Length + 1 > MAX_SPAN_WORDS_CHARS) break;
+            parts.Add(text);
+            length += text.Length + 1;
+        }
+        return string.Join(" ", parts);
+    }
+
+    private static JsonArray FrameContent(
+        string frameB64,
+        double spanStart,
+        double spanEnd,
+        double clipDurationSeconds,
+        string title,
+        string description,
+        string spanWords)
+    {
+        return new JsonArray
         {
             new JsonObject
             {
@@ -142,59 +232,25 @@ public static class Reframe
                 {
                     $"Clip: {title}",
                     $"What happens: {description}",
-                    $"Duration: {Py.F(clipDurationSeconds, 1)}s",
-                    $"Scene cuts (clip-relative seconds): {cutList}",
-                    "",
-                    "Content research context:",
-                    JsonUtil.DumpsIndented(researchContext ?? new JsonObject()),
-                    "",
-                    "Sampled frames follow.",
+                    $"This frame is at {Py.F(spanStart, 1)}s of {Py.F(clipDurationSeconds, 1)}s; "
+                        + $"your framing holds until {Py.F(spanEnd, 1)}s.",
+                    spanWords.Length > 0
+                        ? $"Words spoken in this span: \"{spanWords}\""
+                        : "No speech in this span — frame the visible action.",
                 }),
             },
-        };
-
-        using (var tmp = new TempDir(prefix: "reframe-"))
-        {
-            for (var index = 0; index < sampleTimes.Count; index++)
+            new JsonObject
             {
-                var atSeconds = sampleTimes[index];
-                var framePath = Path.Combine(tmp.Path, $"frame_{index}.jpg");
-                Render.ExtractThumbnail(
-                    clipPath: clipPath, outputPath: framePath, atSeconds: atSeconds);
-                var frameB64 = Convert.ToBase64String(File.ReadAllBytes(framePath));
-                content.Add(new JsonObject
+                ["type"] = "image_url",
+                ["image_url"] = new JsonObject
                 {
-                    ["type"] = "text",
-                    ["text"] = $"Frame at {Py.F(atSeconds, 1)}s:",
-                });
-                content.Add(new JsonObject
-                {
-                    ["type"] = "image_url",
-                    ["image_url"] = new JsonObject
-                    {
-                        ["url"] = $"data:image/jpeg;base64,{frameB64}",
-                    },
-                });
-            }
-        }
-
-        var providers = Providers.EditorProviders(
-            title: "highlighter reframe",
-            openrouterReasoningEffort: REFRAME_REASONING_EFFORT);
-        var (decision, provider) = Providers.RunWithFallback(
-            providers, candidateProvider => RequestCropTrack(candidateProvider, content));
-        var keyframes = new JsonArray();
-        foreach (var keyframe in ValidateKeyframes(decision["keyframes"], clipDurationSeconds))
-            keyframes.Add(keyframe);
-        return new JsonObject
-        {
-            ["keyframes"] = keyframes,
-            ["notes"] = JsonUtil.Truthy(decision["notes"]) ? JsonUtil.Str(decision["notes"]) : "",
-            ["model"] = provider.Model,
+                    ["url"] = $"data:image/jpeg;base64,{frameB64}",
+                },
+            },
         };
     }
 
-    private static JsonObject RequestCropTrack(ChatProvider provider, JsonArray content)
+    private static JsonObject RequestFraming(ChatProvider provider, JsonArray content)
     {
         var body = new JsonObject
         {
@@ -208,8 +264,8 @@ public static class Reframe
                 ["type"] = "json_schema",
                 ["json_schema"] = new JsonObject
                 {
-                    ["name"] = "crop_track",
-                    ["schema"] = ReframeResponseSchema(),
+                    ["name"] = "framing",
+                    ["schema"] = FrameResponseSchema(),
                 },
             },
         };
@@ -225,7 +281,7 @@ public static class Reframe
             ? JsonUtil.StrOrNull(choices[0]?["message"]?["content"])
             : null;
         if (string.IsNullOrEmpty(contentText))
-            throw new PipelineError($"{provider.Label} reframe response did not include content");
+            throw new PipelineError($"{provider.Label} framing response did not include content");
         return Llm.JsonFromText(contentText);
     }
 
@@ -271,7 +327,8 @@ public static class Reframe
     }
 
     /// <summary>Sorted, de-jittered keyframes with the first forced to 0 seconds.
-    /// Falls back to a single centered framing when nothing usable comes back.</summary>
+    /// Falls back to a single wide framing (the whole 16:9 fitted with blurred
+    /// padding) when nothing usable comes back.</summary>
     public static List<JsonObject> ValidateKeyframes(JsonNode? raw, double durationSeconds)
     {
         var keyframes = new List<JsonObject>();
@@ -314,7 +371,7 @@ public static class Reframe
         {
             return new List<JsonObject>
             {
-                new() { ["start_seconds"] = 0.0, ["center_x"] = 0.5, ["wide"] = false },
+                new() { ["start_seconds"] = 0.0, ["center_x"] = 0.5, ["wide"] = true },
             };
         }
 
@@ -400,13 +457,18 @@ public static class Reframe
             // Stretch the WHOLE frame to fill (not cover+crop): a center crop of a
             // dark frame blurs to plain black, while the full frame always carries
             // the shot's palette — and heavy blur hides the distortion.
-            + $"[bg]scale={CANVAS_WIDTH}:{CANVAS_HEIGHT},"
+            //
+            // setsar=1 on every branch: clip renders carry a near-1 SAR (720x406
+            // storage with SAR 406:405 preserving DAR 16:9), and without the reset
+            // ffmpeg stamps a 16:9 DAR onto the 720x1280 output — players then
+            // squish the whole vertical into a letterboxed 16:9 band.
+            + $"[bg]scale={CANVAS_WIDTH}:{CANVAS_HEIGHT},setsar=1,"
             + $"gblur=sigma={BLUR_SIGMA},eq=brightness=-0.06[b];"
             + $"[fgc]crop=w={cropSize}:h={cropSize}:x='{xExpression}':y=0,"
-            + $"scale={CANVAS_WIDTH}:{CANVAS_WIDTH}[fc];"
-            + $"[fgw]scale={CANVAS_WIDTH}:-2[fw];"
+            + $"scale={CANVAS_WIDTH}:{CANVAS_WIDTH},setsar=1[fc];"
+            + $"[fgw]scale={CANVAS_WIDTH}:-2,setsar=1[fw];"
             + $"[b][fc]overlay=0:(H-h)/2:enable='{cropEnable}'[bc];"
-            + $"[bc][fw]overlay=0:(H-h)/2:enable='{wideEnable}'[v]";
+            + $"[bc][fw]overlay=0:(H-h)/2:enable='{wideEnable}',setsar=1[v]";
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
         var (code, _, stderr) = Proc.Run(new List<string>
         {
@@ -427,8 +489,10 @@ public static class Reframe
             "libx264",
             "-preset",
             "veryfast",
+            // The vertical is the short-form deliverable and a second-generation
+            // encode of the clip render, so it gets the lowest CRF in the chain.
             "-crf",
-            "23",
+            "20",
             "-c:a",
             "copy",
             "-movflags",

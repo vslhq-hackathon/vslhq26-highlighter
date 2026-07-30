@@ -62,7 +62,15 @@ public static class Reclip
         var segmentSeconds = JsonUtil.Int(archive["segment_seconds"]);
         var firstIndex = (int)(startSeconds / segmentSeconds);
         var lastIndex = (int)(Math.Max(startSeconds, endSeconds - 0.001) / segmentSeconds);
-        var keys = SegmentKeys(archive, firstIndex: firstIndex, lastIndex: lastIndex);
+        // Editing-master handles: also pull neighbor segments the archive is
+        // known to hold, so a reclip ships with the same ±handle extension room
+        // as ingest-rendered clips (pads shrink when the archive ends).
+        var handle = Defaults.DEFAULT_CLIP_HANDLE_SECONDS;
+        var padFirst = (int)(Math.Max(0, startSeconds - handle) / segmentSeconds);
+        var padLast = (int)(Math.Max(startSeconds, endSeconds + handle - 0.001) / segmentSeconds);
+        if (padFirst < firstIndex && !HasKnownSegment(archive, padFirst)) padFirst = firstIndex;
+        if (padLast > lastIndex && !HasKnownSegment(archive, padLast)) padLast = lastIndex;
+        var keys = SegmentKeys(archive, firstIndex: padFirst, lastIndex: padLast);
 
         var storage = new S3Storage(
             JsonUtil.Str(archive["bucket"]),
@@ -80,6 +88,7 @@ public static class Reclip
         var outputPath = Path.Combine(projectDir, "clips", filename);
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
+        var masterRender = new JsonObject();
         using (var tmpdir = new TempDir(parent: Path.GetDirectoryName(Path.GetFullPath(outputPath))))
         {
             var segmentPaths = new List<string>();
@@ -95,16 +104,71 @@ public static class Reclip
             Render.RenderClipFromSegments(
                 segmentPaths: segmentPaths,
                 outputPath: outputPath,
-                firstSegmentStartSeconds: firstIndex * (double)segmentSeconds,
+                firstSegmentStartSeconds: padFirst * (double)segmentSeconds,
                 startSeconds: startSeconds,
-                endSeconds: endSeconds);
+                endSeconds: endSeconds,
+                profile: EncodeProfile.Delivery);
+
+            try
+            {
+                var masterStart = Math.Max(
+                    padFirst * (double)segmentSeconds, Math.Max(0, startSeconds - handle));
+                var masterFilename = Path.GetFileNameWithoutExtension(filename) + "_master.mp4";
+                var masterPath = Path.Combine(Path.GetDirectoryName(outputPath)!, masterFilename);
+                Render.RenderClipFromSegments(
+                    segmentPaths: segmentPaths,
+                    outputPath: masterPath,
+                    firstSegmentStartSeconds: padFirst * (double)segmentSeconds,
+                    startSeconds: masterStart,
+                    endSeconds: endSeconds + handle,
+                    profile: EncodeProfile.Delivery);
+                var masterDuration = Render.ProbeDuration(masterPath)
+                    ?? (endSeconds + handle - masterStart);
+                masterRender["master_filename"] = masterFilename;
+                masterRender["master_local_path"] =
+                    Path.GetRelativePath(Directory.GetCurrentDirectory(), masterPath);
+                masterRender["master_pad_start"] =
+                    Py.Round(Math.Max(0, startSeconds - masterStart), 3);
+                masterRender["master_pad_end"] = Py.Round(
+                    Math.Max(0, masterDuration - (endSeconds - masterStart)), 3);
+                masterRender["master_duration_seconds"] = Py.Round(masterDuration, 3);
+            }
+            catch (Exception exc)
+            {
+                Console.WriteLine($"Editing-master render failed (non-fatal): {exc.Message}");
+            }
         }
 
         var storageKey = $"projects/{projectId}/clips/{filename}";
-        var videoUrl = db.UploadStorageObject(
+        var videoUrl = Uploads.UploadFittedOrLocalUrl(
+            db,
             bucket: clipsBucket,
             key: storageKey,
-            path: outputPath);
+            path: outputPath,
+            label: "Reclip",
+            durationSeconds: endSeconds - startSeconds);
+        var render = new JsonObject
+        {
+            ["status"] = "rendered",
+            ["bucket"] = clipsBucket,
+            ["storage_path"] = storageKey,
+            ["video_url"] = videoUrl,
+            ["filename"] = filename,
+            ["segment_keys"] = JsonUtil.Arr(keys.Select(key => (JsonNode?)key)),
+        };
+        if (Render.ProbeFps(outputPath) is { } fps) render["fps"] = Py.Round(fps, 3);
+        if (JsonUtil.StrOrNull(masterRender["master_filename"]) is { } masterFile)
+        {
+            foreach (var (key, value) in masterRender.ToList())
+                render[key] = value?.DeepClone();
+            var masterKey = $"projects/{projectId}/clips/{masterFile}";
+            render["master_url"] = Uploads.UploadFittedOrLocalUrl(
+                db, bucket: clipsBucket, key: masterKey,
+                path: Path.Combine(Path.GetDirectoryName(outputPath)!, masterFile),
+                label: "Editing master",
+                durationSeconds: JsonUtil.Double(masterRender["master_duration_seconds"]));
+            render["master_storage_path"] = masterKey;
+        }
         db.InsertClip(
             projectId: projectId,
             title: clipTitle,
@@ -116,18 +180,23 @@ public static class Reclip
             metadata: new JsonObject
             {
                 ["source"] = "reclip",
-                ["render"] = new JsonObject
-                {
-                    ["status"] = "rendered",
-                    ["bucket"] = clipsBucket,
-                    ["storage_path"] = storageKey,
-                    ["video_url"] = videoUrl,
-                    ["filename"] = filename,
-                    ["segment_keys"] = JsonUtil.Arr(keys.Select(key => (JsonNode?)key)),
-                },
+                ["render"] = render,
             });
         Console.WriteLine($"Clip stored: {videoUrl}");
         Console.WriteLine($"Local copy: {outputPath}");
+    }
+
+    /// <summary>True when the archive's recorded keys include this segment.
+    /// Prefix-only archives can't answer, so padding stays off for them rather
+    /// than gambling on a download that may 404.</summary>
+    private static bool HasKnownSegment(JsonObject archive, int index)
+    {
+        foreach (var node in archive["segment_keys"] as JsonArray ?? new JsonArray())
+        {
+            var match = Regex.Match(JsonUtil.Str(node), @"video_(\d+)\.ts$");
+            if (match.Success && int.Parse(match.Groups[1].Value) == index) return true;
+        }
+        return false;
     }
 
     private static List<string> SegmentKeys(JsonObject archive, int firstIndex, int lastIndex)

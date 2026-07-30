@@ -39,7 +39,29 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public bool CanUndo => _undo.Count > 0;
     public bool CanRedo => _redo.Count > 0;
     public double OutputDuration => Doc is null ? 0 : Doc.Segments.Sum(s => (s.SrcEnd - s.SrcStart) / s.Speed);
-    public double PlayheadOutput => Doc is null ? 0 : SourceToOutput(Playhead) ?? 0;
+    public double PlayheadOutput => Doc is null ? 0 : OutputAt(Playhead);
+
+    /// <summary>The media's real frame rate (probed server-side), 30 when unknown.</summary>
+    public double Fps => Meta?.SourceFps is { } fps && fps > 0 ? fps : 30;
+    public double FrameStep => 1.0 / Fps;
+
+    /// <summary>J/K/L shuttle multiplier: 1 = normal, 2/4 = fast forward,
+    /// negative = reverse scrub. Shown as a chip in the transport bar.</summary>
+    public double ShuttleRate { get; private set; } = 1;
+
+    public void SetShuttleRate(double rate)
+    {
+        ShuttleRate = rate;
+        notify();
+    }
+
+    // Handle material (padded editing master): how many seconds the first/last
+    // segment can still extend outward into rendered-but-uncut footage.
+    public double AvailableLead => Doc?.Segments.FirstOrDefault()?.SrcStart ?? 0;
+    public double AvailableTail =>
+        Doc is { Segments.Count: > 0 } doc && Meta?.SourceDuration is { } duration && duration > 0
+            ? Math.Max(0, duration - doc.Segments[^1].SrcEnd)
+            : 0;
 
     public EdlSegment? SelectedSegment => Doc?.Segments.FirstOrDefault(s => s.Id == SelectedId);
     public EdlCaption? SelectedCaption => Doc?.Captions.FirstOrDefault(c => c.Id == SelectedId);
@@ -110,7 +132,17 @@ public sealed class EditorSession(ApiClient api, Action notify)
         }).ToList();
         if (segments.Count == 1 && segments[0].SrcStart == 0 && segments[0].SrcEnd <= 0.05
             && response.SourceDuration > 0.05)
-            segments = [segments[0] with { SrcEnd = response.SourceDuration }];
+        {
+            // Rebuild inside the original cut, not the whole master — handle
+            // material stays outside the timeline until the user extends into it.
+            var lead = response.Handles?.Lead ?? 0;
+            var tail = response.Handles?.Tail ?? 0;
+            segments = [segments[0] with
+            {
+                SrcStart = lead,
+                SrcEnd = Math.Max(lead + 0.1, response.SourceDuration - tail),
+            }];
+        }
         doc = doc with
         {
             Segments = segments,
@@ -145,6 +177,25 @@ public sealed class EditorSession(ApiClient api, Action notify)
             elapsed += (segment.SrcEnd - segment.SrcStart) / segment.Speed;
         }
         return null;
+    }
+
+    /// <summary>Total source→output mapping — unlike SourceToOutput it never
+    /// returns null: a time inside a cut region maps to the end of the
+    /// preceding kept segment, before the first segment to 0, past the last
+    /// to the timeline end. Transport math must use this, or a playhead
+    /// parked in a cut teleports every step back to zero.</summary>
+    public double OutputAt(double sourceTime)
+    {
+        if (Doc is null) return 0;
+        double elapsed = 0;
+        foreach (var segment in Doc.Segments)
+        {
+            if (sourceTime < segment.SrcStart - 1e-6) return elapsed;
+            if (sourceTime <= segment.SrcEnd + 1e-6)
+                return elapsed + Math.Max(0, sourceTime - segment.SrcStart) / segment.Speed;
+            elapsed += (segment.SrcEnd - segment.SrcStart) / segment.Speed;
+        }
+        return elapsed;
     }
 
     public double OutputToSource(double outputTime)
@@ -229,8 +280,49 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public void StepOutput(double deltaSeconds)
     {
         if (Doc is null || OutputDuration <= 0) return;
-        var target = Math.Clamp(PlayheadOutput + deltaSeconds, 0, Math.Max(0, OutputDuration - 0.02));
+        var end = Math.Max(0, OutputDuration - Math.Min(FrameStep, 0.02));
+        var target = Math.Clamp(PlayheadOutput + deltaSeconds, 0, end);
         RequestSeek(OutputToSource(target));
+    }
+
+    /// <summary>⏮/⏭ and ↑/↓: previous/next edit point. Edges are every segment
+    /// boundary in output time plus the timeline end. Going back stops at the
+    /// current segment's start first (standard NLE behavior); going forward
+    /// past the last segment parks at the timeline end — never wraps to 0.</summary>
+    public void JumpEdit(int direction)
+    {
+        if (Doc is null) return;
+        var layout = SegmentLayout();
+        if (layout.Count == 0) return;
+        var edges = layout.Select(entry => entry.OutStart).Append(OutputDuration).ToList();
+        var current = PlayheadOutput;
+        var tolerance = Math.Max(FrameStep / 2, 0.02);
+        if (direction > 0)
+        {
+            var next = edges.FirstOrDefault(edge => edge > current + tolerance, double.NaN);
+            if (double.IsNaN(next)) return; // already parked at the end
+            SeekOutputEdge(next, layout);
+        }
+        else
+        {
+            SeekOutputEdge(edges.LastOrDefault(edge => edge < current - tolerance, 0), layout);
+        }
+    }
+
+    private void SeekOutputEdge(
+        double outputEdge, List<(EdlSegment Segment, double OutStart, double OutEnd)> layout)
+    {
+        foreach (var entry in layout)
+        {
+            if (Math.Abs(entry.OutStart - outputEdge) < 1e-6)
+            {
+                // A hair inside the segment, so the playback loop can't
+                // mistake the boundary for a cut region.
+                RequestSeek(entry.Segment.SrcStart + 0.001);
+                return;
+            }
+        }
+        RequestSeek(OutputToSource(Math.Max(0, outputEdge - Math.Min(FrameStep, 0.02))));
     }
 
     public void SetPreview(string? url)
@@ -254,8 +346,29 @@ public sealed class EditorSession(ApiClient api, Action notify)
         notify();
     }
 
-    public double Snap(double seconds, bool snapOn) =>
-        snapOn ? Math.Round(seconds * 4) / 4.0 : seconds;
+    /// <summary>Timeline snapping: segment edges and the playhead win inside a
+    /// zoom-scaled tolerance (~8px), then the ¼s grid — so drags land exactly
+    /// on neighboring cuts the way professional NLEs snap.</summary>
+    public double Snap(double seconds, bool snapOn)
+    {
+        if (!snapOn) return seconds;
+        if (Doc is not null)
+        {
+            var tolerance = 8 / Math.Max(2, PxPerSec);
+            double? best = null;
+            foreach (var candidate in Doc.Segments
+                .SelectMany(s => new[] { s.SrcStart, s.SrcEnd })
+                .Append(Playhead))
+            {
+                var distance = Math.Abs(candidate - seconds);
+                if (distance <= tolerance
+                    && (best is null || distance < Math.Abs(best.Value - seconds)))
+                    best = candidate;
+            }
+            if (best is { } edge) return edge;
+        }
+        return Math.Round(seconds * 4) / 4.0;
+    }
 
     // ---- mutations (all undoable) ----------------------------------------- //
 
@@ -482,6 +595,29 @@ public sealed class EditorSession(ApiClient api, Action notify)
             Math.Clamp(voice ?? doc.Audio.Voice, 0, 2),
             Math.Clamp(music ?? doc.Audio.Music, 0, 1)),
     }, coalesceKey: "audio");
+
+    /// <summary>Pull handle material onto the timeline: move the first
+    /// segment's in-point earlier into the padded master (clamped at 0).</summary>
+    public void ExtendStart(double seconds)
+    {
+        if (Doc is null || Doc.Segments.Count == 0) return;
+        var first = Doc.Segments[0];
+        var target = Math.Max(0, first.SrcStart - seconds);
+        if (target >= first.SrcStart - 1e-6) return;
+        TrimSegment(first.Id, leftEdge: true, target);
+        RequestSeek(target + 0.001); // reveal the new opening frame
+    }
+
+    public void ExtendEnd(double seconds)
+    {
+        if (Doc is null || Doc.Segments.Count == 0) return;
+        var last = Doc.Segments[^1];
+        var max = Meta?.SourceDuration is { } known && known > 0 ? known : last.SrcEnd;
+        var target = Math.Min(max, last.SrcEnd + seconds);
+        if (target <= last.SrcEnd + 1e-6) return;
+        TrimSegment(last.Id, leftEdge: false, target);
+        RequestSeek(Math.Max(0, target - 1.0)); // land just before the new tail
+    }
 
     /// <summary>Mark in/out: trim the segment under the playhead to start or end
     /// at the playhead.</summary>

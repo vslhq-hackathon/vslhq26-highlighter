@@ -14,9 +14,16 @@ public static class EditorDocs
 
     public static readonly string[] CaptionStyles = ["boxed", "plain", "karaoke"];
 
-    public static EditorDoc Default(double sourceDuration, IReadOnlyList<EdlCaption> captions) =>
-        new(Version,
-            Segments: [new EdlSegment("s1", 0, Math.Max(0.04, sourceDuration))],
+    /// <summary>cutStart/cutEnd place the seeded segment inside a padded
+    /// editing master (handle material outside the cut stays off the timeline
+    /// until the user extends into it); the defaults cover the whole source.</summary>
+    public static EditorDoc Default(double sourceDuration, IReadOnlyList<EdlCaption> captions,
+        double cutStart = 0, double? cutEnd = null)
+    {
+        var start = Math.Max(0, cutStart);
+        var end = Math.Max(start + 0.04, cutEnd ?? Math.Max(0.04, sourceDuration));
+        return new(Version,
+            Segments: [new EdlSegment("s1", start, end)],
             Captions: captions,
             CaptionStyle: "boxed",
             Texts: [],
@@ -24,6 +31,28 @@ public static class EditorDocs
             Transform: new EdlTransform(),
             Audio: new EdlAudio(),
             Reframe: "auto");
+    }
+
+    /// <summary>Shift every timing in the document by a constant offset — used
+    /// to re-base a doc authored against the bare clip onto its padded master.</summary>
+    public static EditorDoc ShiftDoc(EditorDoc doc, double offset) => doc with
+    {
+        Segments = doc.Segments
+            .Select(s => s with { SrcStart = s.SrcStart + offset, SrcEnd = s.SrcEnd + offset })
+            .ToList(),
+        Captions = doc.Captions
+            .Select(c => c with
+            {
+                Start = c.Start + offset,
+                End = c.End + offset,
+                Words = c.Words?.Select(w => w with { S = w.S + offset, E = w.E + offset }).ToList(),
+            })
+            .ToList(),
+        Texts = doc.Texts
+            .Select(t => t with { Start = t.Start + offset, End = t.End + offset })
+            .ToList(),
+        Markers = doc.Markers.Select(m => m with { At = m.At + offset }).ToList(),
+    };
 
     /// <summary>Caption lines from transcript words whose ABSOLUTE timings fall
     /// inside [windowStart, windowEnd] on the source clock; emitted times are

@@ -39,6 +39,11 @@ public record EditorDoc(
 public record EditorExportInfoDto(
     string? Url, string? ThumbnailUrl, double? DurationSeconds, DateTimeOffset? ExportedAt);
 
+/// <summary>Handle material on a clip's padded editing master: Lead/Tail are
+/// the seconds of extra footage rendered before/after the original cut, so
+/// the editor can trim outward past the LLM's cut points.</summary>
+public record EditorHandlesDto(double Lead, double Tail);
+
 /// <summary>GET .../editor — the document plus everything the editor UI needs
 /// about the media it edits.</summary>
 public record EditorDocResponse(
@@ -50,7 +55,9 @@ public record EditorDocResponse(
     string? PosterUrl,
     double SourceDuration,
     DateTimeOffset? SavedAt,
-    EditorExportInfoDto? Export);
+    EditorExportInfoDto? Export,
+    double? SourceFps = null,
+    EditorHandlesDto? Handles = null);
 
 public record SaveEditorRequest(EditorDoc? Doc);
 

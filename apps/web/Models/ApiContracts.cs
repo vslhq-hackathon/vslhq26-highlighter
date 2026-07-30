@@ -106,7 +106,17 @@ public record CreateProjectRequest(
 
 public record CancelResultDto(Guid ProjectId, string Status, string? JobId, bool ForceKilled);
 
-public record ReviseRequestDto(string? Request);
+public record ReviseRequestDto(string? Request, bool FromChat = false);
+
+/// <summary>One durable studio-agent chat message. JobFinal marks the
+/// server-written completion message for the job JobId started.</summary>
+public record AgentMessageDto(
+    Guid Id,
+    string Role,
+    string Text,
+    string? JobId,
+    bool JobFinal,
+    DateTimeOffset CreatedAt);
 
 public record PublishRequestDto(
     string? Target,
@@ -164,6 +174,8 @@ public record EditorDoc(
 public record EditorExportInfoDto(
     string? Url, string? ThumbnailUrl, double? DurationSeconds, DateTimeOffset? ExportedAt);
 
+public record EditorHandlesDto(double Lead, double Tail);
+
 public record EditorDocResponse(
     EditorDoc Doc,
     string Target,
@@ -173,7 +185,9 @@ public record EditorDocResponse(
     string? PosterUrl,
     double SourceDuration,
     DateTimeOffset? SavedAt,
-    EditorExportInfoDto? Export);
+    EditorExportInfoDto? Export,
+    double? SourceFps = null,
+    EditorHandlesDto? Handles = null);
 
 public record SaveEditorRequest(EditorDoc Doc);
 

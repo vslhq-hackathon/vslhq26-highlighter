@@ -32,12 +32,12 @@ public sealed record ChatProvider(
 /// ordered per-role chains over Azure OpenAI and OpenRouter.
 ///
 /// Every LLM call in the pipeline is one of two roles: editor (text and vision
-/// calls — long-form pass 2, the auto-reframe framing call, the research
-/// attempt), where the Azure deployment runs first when its env vars are set
-/// (role-specific AZURE_EDITOR_* names, or the shared AZURE_OPENAI_* names)
-/// with OpenRouter Gemini next; and audio (calls that hear the source — pass-1
-/// clip scoring, the revision agent), where OpenRouter Gemini runs first with
-/// the Azure deployment next. RunWithFallback tries a chain in order, so a
+/// calls — long-form pass 2, the auto-reframe framing call) and audio (calls
+/// that hear the source — pass-1 clip scoring, the revision agent). Both roles
+/// run OpenRouter Gemini first whenever OPENROUTER_API_KEY is set, with the
+/// role's Azure deployment as the fallback (role-specific AZURE_EDITOR_* /
+/// AZURE_AUDIO_* names, or the shared AZURE_OPENAI_* names).
+/// RunWithFallback tries a chain in order, so a
 /// missing or failing provider degrades to the next one instead of failing the
 /// run. Azure requests go through the resource's OpenAI-compatible v1 endpoint
 /// with the deployment name as the model; reasoning deployments run at the
@@ -64,8 +64,8 @@ public static class Providers
         string title, string openrouterReasoningEffort = Defaults.DEFAULT_LLM_REASONING_EFFORT)
     {
         return Chain(
-            AzureEditorProvider(),
             OpenRouterProvider(title, openrouterReasoningEffort),
+            AzureEditorProvider(),
             role: "editor");
     }
 

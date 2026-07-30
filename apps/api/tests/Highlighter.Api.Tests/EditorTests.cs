@@ -243,6 +243,18 @@ public class EditorRendererTests
     }
 
     [Fact]
+    public void BuildFitArgs_TargetsBitrate_AndCopiesAudio()
+    {
+        var args = EditorRenderer.BuildFitArgs("export.mp4", "export_fit.mp4", 1_500_000);
+        Assert.Equal("export.mp4", args[args.IndexOf("-i") + 1]);
+        Assert.Equal("1500000", args[args.IndexOf("-b:v") + 1]);
+        Assert.Equal("1500000", args[args.IndexOf("-maxrate") + 1]);
+        Assert.Equal("3000000", args[args.IndexOf("-bufsize") + 1]);
+        Assert.Equal("copy", args[args.IndexOf("-c:a") + 1]);
+        Assert.Equal("export_fit.mp4", args[^1]);
+    }
+
+    [Fact]
     public void CaptionRasterizer_ProducesPngs()
     {
         foreach (var style in new[] { "boxed", "plain", "karaoke" })

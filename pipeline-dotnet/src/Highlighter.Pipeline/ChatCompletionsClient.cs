@@ -30,6 +30,9 @@ public class ChatCompletionsStatusException : Exception
 public sealed class ChatCompletionsClient : IDisposable
 {
     private const int MaxRetries = 2;
+    // Rate limits deserve more patience than transient faults: with the LLM
+    // pool running many calls in flight, a 429 burst just needs to queue.
+    private const int MaxRetries429 = 4;
 
     private readonly HttpClient _http;
     private readonly string _baseUrl;
@@ -55,6 +58,7 @@ public sealed class ChatCompletionsClient : IDisposable
         var payload = JsonUtil.Dumps(body);
         for (var attempt = 0; ; attempt++)
         {
+            double? retryAfterSeconds = null;
             try
             {
                 using var request = new HttpRequestMessage(
@@ -68,8 +72,10 @@ public sealed class ChatCompletionsClient : IDisposable
                 if (response.IsSuccessStatusCode) return JsonUtil.ParseObject(text);
 
                 var status = (int)response.StatusCode;
+                retryAfterSeconds = RetryAfterSeconds(response);
+                var maxAttempts = status == 429 ? MaxRetries429 : MaxRetries;
                 var retryable = status == 408 || status == 429 || status >= 500;
-                if (!retryable || attempt >= MaxRetries)
+                if (!retryable || attempt >= maxAttempts)
                     throw new ChatCompletionsStatusException(status, text);
             }
             catch (HttpRequestException) when (attempt < MaxRetries)
@@ -81,15 +87,30 @@ public sealed class ChatCompletionsClient : IDisposable
                 // request timeout — retry (the SDK retries APITimeoutError too)
             }
 
-            Backoff(attempt);
+            Backoff(attempt, retryAfterSeconds);
         }
     }
 
-    private static void Backoff(int attempt)
+    /// <summary>Retry-After from a throttled response — delta-seconds or
+    /// HTTP-date form — or null when absent/unparsable.</summary>
+    internal static double? RetryAfterSeconds(HttpResponseMessage response)
     {
-        // The openai SDK's schedule: 0.5s * 2^n with jitter, capped at 8s.
+        var header = response.Headers.RetryAfter;
+        if (header?.Delta is { } delta) return Math.Max(0, delta.TotalSeconds);
+        if (header?.Date is { } date)
+            return Math.Max(0, (date - DateTimeOffset.UtcNow).TotalSeconds);
+        return null;
+    }
+
+    private static void Backoff(int attempt, double? retryAfterSeconds = null)
+    {
+        // The openai SDK's schedule: 0.5s * 2^n with jitter, capped at 8s —
+        // but never shorter than what the server's Retry-After asked for
+        // (itself capped so a hostile header can't stall a worker thread).
         var seconds = Math.Min(0.5 * Math.Pow(2, attempt), 8.0);
         seconds *= 1.0 - Random.Shared.NextDouble() * 0.25;
+        if (retryAfterSeconds is { } wanted)
+            seconds = Math.Max(seconds, Math.Min(wanted, 60.0));
         Thread.Sleep(TimeSpan.FromSeconds(seconds));
     }
 

@@ -3,7 +3,8 @@ using Highlighter.Web.Services;
 namespace Highlighter.Web.Models;
 
 /// <summary>One message in the studio agent conversation.</summary>
-public record AgentChatMessage(string Role, string Text);
+public record AgentChatMessage(
+    string Role, string Text, string? JobId = null, bool JobFinal = false);
 
 /// <summary>
 /// UI state for the studio — the same state machine the static design used
@@ -609,8 +610,26 @@ public class StudioState : IDisposable
     /// for a highlight clip — the agent's capabilities differ per context.</summary>
     public string AgentContext { get; set; } = "short";
 
+    /// <summary>The job the agent's in-flight turn started (revise): stamped
+    /// onto the persisted assistant message so the server can pair its
+    /// completion row with it.</summary>
+    public string? PendingAgentJobId { get; set; }
+
     public void AddAgentMessage(string role, string text) =>
         Set(() => AgentMessages.Add(new AgentChatMessage(role, text)));
+
+    /// <summary>Swap in the server's transcript. No-op while a turn is in
+    /// flight, so a background refresh can't clobber the optimistic list.</summary>
+    public void ReplaceAgentMessages(IEnumerable<AgentChatMessage> messages)
+    {
+        if (AgentBusy) return;
+        Set(() =>
+        {
+            AgentMessages.Clear();
+            AgentMessages.AddRange(messages);
+        });
+    }
+
     public void SetAgentBusy(bool busy) => Set(() => AgentBusy = busy);
     public void Notify() => Changed?.Invoke();
 }

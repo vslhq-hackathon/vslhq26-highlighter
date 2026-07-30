@@ -8,7 +8,8 @@ namespace Highlighter.Api.Services;
 /// source URL or --min-clip-score: in attach mode the project row wins.</summary>
 public static class WorkerArgs
 {
-    public static List<string> Ingest(Guid projectId, CreateProjectRequest request)
+    public static List<string> Ingest(Guid projectId, CreateProjectRequest request,
+        int? llmConcurrency = null, int? transcribeConcurrency = null)
     {
         var argv = new List<string>
         {
@@ -30,6 +31,12 @@ public static class WorkerArgs
         if (request.NoCaptions) argv.Add("--no-captions");
         if (request.NoThumbnails) argv.Add("--no-thumbnails");
         if (request.NoArchive) argv.Add("--no-archive");
+        // API-call parallelism (measured against the Azure deployments' rate
+        // limits, configured via .env) — explicit for the same reason as above.
+        if (llmConcurrency is { } llm and > 0)
+            argv.AddRange(["--llm-concurrency", Invariant(llm)]);
+        if (transcribeConcurrency is { } stt and > 0)
+            argv.AddRange(["--transcribe-concurrency", Invariant(stt)]);
         return argv;
     }
 

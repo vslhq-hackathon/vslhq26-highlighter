@@ -13,7 +13,22 @@ namespace Highlighter.Api.Services;
 /// touches the system.</summary>
 public sealed class EditorRenderer(ILogger<EditorRenderer> log)
 {
-    public sealed record SourceInfo(double Duration, int Width, int Height, bool HasAudio);
+    public sealed record SourceInfo(
+        double Duration, int Width, int Height, bool HasAudio, double? Fps = null);
+
+    /// <summary>ffprobe reports frame rate as a fraction ("30000/1001", "25/1");
+    /// null on "0/0" or anything unparsable.</summary>
+    public static double? ParseFrameRate(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var parts = raw.Split('/');
+        if (parts.Length == 2
+            && double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var numerator)
+            && double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var denominator))
+            return denominator > 0 && numerator > 0 ? numerator / denominator : null;
+        return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
+            && value > 0 ? value : null;
+    }
 
     private static string F(double value) => value.ToString("0.###", CultureInfo.InvariantCulture);
 
@@ -24,7 +39,7 @@ public sealed class EditorRenderer(ILogger<EditorRenderer> log)
         var output = await RunAsync("ffprobe",
         [
             "-v", "error",
-            "-show_entries", "stream=codec_type,width,height:format=duration",
+            "-show_entries", "stream=codec_type,width,height,avg_frame_rate:format=duration",
             "-of", "json", path,
         ], logLine, ct);
         using var doc = System.Text.Json.JsonDocument.Parse(output);
@@ -33,6 +48,7 @@ public sealed class EditorRenderer(ILogger<EditorRenderer> log)
             && format.TryGetProperty("duration", out var d))
             double.TryParse(d.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out duration);
         int width = 0, height = 0;
+        double? fps = null;
         var hasAudio = false;
         if (doc.RootElement.TryGetProperty("streams", out var streams))
         {
@@ -43,13 +59,15 @@ public sealed class EditorRenderer(ILogger<EditorRenderer> log)
                 {
                     width = stream.TryGetProperty("width", out var w) ? w.GetInt32() : 0;
                     height = stream.TryGetProperty("height", out var h) ? h.GetInt32() : 0;
+                    if (stream.TryGetProperty("avg_frame_rate", out var rate))
+                        fps = ParseFrameRate(rate.GetString());
                 }
                 if (type == "audio") hasAudio = true;
             }
         }
         if (width == 0 || height == 0 || duration <= 0)
             throw new InvalidOperationException($"could not probe {path}");
-        return new SourceInfo(duration, width, height, hasAudio);
+        return new SourceInfo(duration, width, height, hasAudio, fps);
     }
 
     // ---- pure builders --------------------------------------------------- //
@@ -214,6 +232,21 @@ public sealed class EditorRenderer(ILogger<EditorRenderer> log)
         }
         return items;
     }
+
+    /// <summary>One-shot bitrate-targeted re-encode used when an export exceeds
+    /// the Supabase object-size cap (audio copied untouched).</summary>
+    public static List<string> BuildFitArgs(string inputPath, string outputPath, long videoBitrate) =>
+    [
+        "-hide_banner", "-loglevel", "warning", "-y",
+        "-i", inputPath,
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-b:v", videoBitrate.ToString(CultureInfo.InvariantCulture),
+        "-maxrate", videoBitrate.ToString(CultureInfo.InvariantCulture),
+        "-bufsize", (videoBitrate * 2).ToString(CultureInfo.InvariantCulture),
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        outputPath,
+    ];
 
     public static List<string> BuildThumbnailArgs(string videoPath, double atSeconds, string outputPath) =>
     [

@@ -1,8 +1,25 @@
 namespace Highlighter.Pipeline;
 
+/// <summary>Encode quality tiers. Working is the pre-bump pipeline quality —
+/// intermediates and the long-form assembly path, where the codec-copy stitch
+/// makes the trim/render settings the final settings. Delivery is for
+/// short-form deliverables users stream from Supabase.</summary>
+public enum EncodeProfile
+{
+    Working,
+    Delivery,
+}
+
 /// <summary>Port of highlighter_pipeline/render.py.</summary>
 public static class Render
 {
+    // Both profiles cap at 720p: capture uses yt-dlp's pre-merged best format,
+    // which never exceeds 720 wide, so a bigger cap only upscales.
+    private const string SCALE_720 = "scale='min(720,iw)':-2";
+
+    private static string ProfileCrf(EncodeProfile profile) =>
+        profile == EncodeProfile.Delivery ? "23" : "30";
+
     /// <summary>A combined run passes suffix ("_short"/"_long") so the two
     /// forks never collide on a filename when they pick the same window.</summary>
     public static string ClipFilename(
@@ -63,7 +80,8 @@ public static class Render
         string outputPath,
         double firstSegmentStartSeconds,
         double startSeconds,
-        double endSeconds)
+        double endSeconds,
+        EncodeProfile profile = EncodeProfile.Working)
     {
         ValidateWindow(startSeconds: startSeconds, endSeconds: endSeconds);
         var missing = segmentPaths.Where(path => !File.Exists(path)).ToList();
@@ -105,9 +123,9 @@ public static class Render
             "-preset",
             "veryfast",
             "-crf",
-            "20",
+            ProfileCrf(profile),
             "-vf",
-            "scale='min(1920,iw)':-2",
+            SCALE_720,
             "-c:a",
             "aac",
             "-b:a",
@@ -119,7 +137,8 @@ public static class Render
     }
 
     /// <summary>Re-encode a window of an already-rendered clip (same encode settings as
-    /// renders, so trimmed segments still codec-copy concat with untrimmed ones).</summary>
+    /// Working-profile renders, so trimmed segments still codec-copy concat with
+    /// untrimmed long-fork ones).</summary>
     public static void TrimClip(
         string sourcePath, string outputPath, double startOffsetSeconds, double durationSeconds)
     {
@@ -144,9 +163,9 @@ public static class Render
             "-preset",
             "veryfast",
             "-crf",
-            "20",
+            "30",
             "-vf",
-            "scale='min(1920,iw)':-2",
+            SCALE_720,
             "-c:a",
             "aac",
             "-b:a",
@@ -200,9 +219,9 @@ public static class Render
             "-preset",
             "veryfast",
             "-crf",
-            "20",
+            "30",
             "-vf",
-            "scale='min(1920,iw)':-2",
+            SCALE_720,
             "-c:a",
             "aac",
             "-b:a",
@@ -240,6 +259,59 @@ public static class Render
             out var value)
             ? value
             : null;
+    }
+
+    /// <summary>The container's duration in seconds, or null when unreadable.</summary>
+    public static double? ProbeDuration(string path)
+    {
+        var (code, stdout, _) = Proc.Run(new[]
+        {
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            path,
+        });
+        if (code != 0) return null;
+        return double.TryParse(
+            stdout.Trim(),
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var value) && value > 0
+            ? value
+            : null;
+    }
+
+    /// <summary>The video stream's average frame rate ("30000/1001" → 29.97),
+    /// or null when unreadable — the editor uses it for real frame stepping.</summary>
+    public static double? ProbeFps(string path)
+    {
+        var (code, stdout, _) = Proc.Run(new[]
+        {
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "csv=p=0",
+            path,
+        });
+        if (code != 0) return null;
+        var raw = stdout.Trim();
+        var parts = raw.Split('/');
+        var style = System.Globalization.NumberStyles.Float;
+        var culture = System.Globalization.CultureInfo.InvariantCulture;
+        if (parts.Length == 2
+            && double.TryParse(parts[0], style, culture, out var numerator)
+            && double.TryParse(parts[1], style, culture, out var denominator))
+            return numerator > 0 && denominator > 0 ? numerator / denominator : null;
+        return double.TryParse(raw, style, culture, out var value) && value > 0 ? value : null;
     }
 
     private static void ValidateWindow(double startSeconds, double endSeconds)

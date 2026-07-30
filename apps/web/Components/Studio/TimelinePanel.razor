@@ -5,8 +5,9 @@
    block), text and marker (click adds one at that time). Snap = ¼-second grid.
    Delete removes the selection. All edits are undoable and autosaved. *@
 
+@* Keyboard lives on EditorOverlay's document-level listener — a second
+   handler here would double-fire every shortcut. *@
 <div class="anim-fade-up flex h-[272px] shrink-0 flex-col border-t border-line bg-ink outline-none" style="animation-delay:150ms"
-     tabindex="0" @onkeydown="OnKey" @onkeydown:preventDefault="false"
      @onpointermove="OnPointerMove" @onpointerup="OnPointerUp" @onpointerleave="OnPointerUp">
     @* toolbar *@
     <div class="flex items-center gap-0.5 border-b border-line bg-panel px-2.5 py-[5px]">
@@ -126,6 +127,16 @@
                                     <div @onpointerdown='e => OnBlockPointerDown(e, segment.Id, "trim-right")' @onpointerdown:stopPropagation
                                          class="absolute bottom-0 right-0 top-0 w-[6px] cursor-ew-resize bg-[rgba(217,242,75,0.0)] hover:bg-[rgba(217,242,75,0.35)]"></div>
                                 </div>
+                            }
+                            @* Handle-material end caps: media beyond the edit
+                               (the professional-NLE cue that outward trims work) *@
+                            @if (E.Meta?.Handles is not null && E.AvailableLead > 0.05)
+                            {
+                                <span class="pointer-events-none absolute left-0.5 top-1/2 z-[5] -translate-y-1/2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1 py-0.5 font-mono text-[8.5px] text-accent">⟨+@($"{E.AvailableLead:0.0}")s</span>
+                            }
+                            @if (E.Meta?.Handles is not null && E.AvailableTail > 0.05)
+                            {
+                                <span class="pointer-events-none absolute top-1/2 z-[5] -translate-y-1/2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1 py-0.5 font-mono text-[8.5px] text-accent" style="left:calc(@Px(E.OutputDuration) + 2px)">+@($"{E.AvailableTail:0.0}")s⟩</span>
                             }
                         </div>
                     </div>
@@ -334,22 +345,6 @@
     {
         _dragId = null;
         _dragOriginal = null;
-    }
-
-    private void OnKey(KeyboardEventArgs e)
-    {
-        switch (e.Key)
-        {
-            case "Delete" or "Backspace":
-                E.DeleteSelected();
-                break;
-            case "z" when e.MetaKey || e.CtrlKey:
-                if (e.ShiftKey) E.Redo(); else E.Undo();
-                break;
-            case " ":
-                S.TogglePlay();
-                break;
-        }
     }
 
     // ---- visible windows ----

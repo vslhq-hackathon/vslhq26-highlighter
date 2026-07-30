@@ -19,11 +19,26 @@ public sealed class EditorExportService(
 {
     public const string HttpClientName = "media-download";
 
+    // Supabase rejects objects over the project cap (measured: 50 MiB) with a
+    // 413. Twin of Uploads.MaxStorageUploadBytes in pipeline-dotnet — the API
+    // deliberately has no project reference there, so the env var is the shared
+    // contract. Exports must FIT (re-encode), not fall back to /media: the work
+    // dir is deleted after the job.
+    private const long DefaultMaxUploadBytes = 49L * 1024 * 1024;
+
+    private static long MaxUploadBytes()
+    {
+        var raw = Environment.GetEnvironmentVariable("HIGHLIGHTER_MAX_UPLOAD_BYTES");
+        return raw is not null && long.TryParse(raw, out var value) && value > 0
+            ? value
+            : DefaultMaxUploadBytes;
+    }
+
     public PipelineJob StartClipExport(Guid projectId, ClipDto clip, EditorDoc doc,
-        Guid? ownerId = null) =>
+        MasterInfo? master = null, Guid? ownerId = null) =>
         jobs.StartExternal("editor-export", projectId,
             ["editor-export", "clip", clip.Id.ToString()],
-            (job, ct) => RunClipExportAsync(job, projectId, clip, doc, ct), ownerId);
+            (job, ct) => RunClipExportAsync(job, projectId, clip, doc, master, ct), ownerId);
 
     public PipelineJob StartLongformExport(Guid projectId, JsonObject editRow, EditorDoc doc,
         Guid? ownerId = null) =>
@@ -35,15 +50,24 @@ public sealed class EditorExportService(
     // ---- clip ------------------------------------------------------------ //
 
     private async Task<int> RunClipExportAsync(
-        PipelineJob job, Guid projectId, ClipDto clip, EditorDoc doc, CancellationToken ct)
+        PipelineJob job, Guid projectId, ClipDto clip, EditorDoc doc, MasterInfo? master,
+        CancellationToken ct)
     {
         var work = WorkDir(job.Id);
         try
         {
-            var sourceUrl = clip.VerticalUrl ?? clip.VideoUrl ?? clip.CaptionedUrl
-                ?? throw new InvalidOperationException("the clip has no rendered media to edit");
+            // The doc's source seconds run against the padded master when one
+            // exists (handle material is legal timeline content); prefer the
+            // local file when this machine rendered it.
+            var masterLocal = master?.LocalPath is { } relative
+                ? Path.Combine(layout.RepoRoot, relative)
+                : null;
+            var source = masterLocal is not null && File.Exists(masterLocal)
+                ? masterLocal
+                : master?.Url ?? clip.VerticalUrl ?? clip.VideoUrl ?? clip.CaptionedUrl
+                    ?? throw new InvalidOperationException("the clip has no rendered media to edit");
             var (outputPath, thumbPath, outputDuration) =
-                await RenderAsync(job, work, sourceUrl, doc, ct);
+                await RenderAsync(job, work, source, doc, ct);
 
             var videoKey = $"{projectId}/editor/clip_{clip.Id}.mp4";
             var thumbKey = $"{projectId}/editor/clip_{clip.Id}.jpg";
@@ -225,6 +249,20 @@ public sealed class EditorExportService(
         await renderer.RunAsync("ffmpeg",
             EditorRenderer.BuildThumbnailArgs(outputPath, outputDuration * 0.25, thumbPath),
             Line, ct, work);
+
+        var cap = MaxUploadBytes();
+        if (new FileInfo(outputPath).Length > cap && outputDuration > 0)
+        {
+            // 92% of the cap's bit budget minus the audio track's share.
+            var videoBitrate = Math.Max(
+                300_000L, (long)(cap * 8 / outputDuration * 0.92) - 160_000L);
+            var fitPath = Path.Combine(work, "export_fit.mp4");
+            job.Append("api", $"export exceeds the storage cap; re-encoding at "
+                + $"{videoBitrate / 1000} kbps to fit");
+            await renderer.RunAsync("ffmpeg",
+                EditorRenderer.BuildFitArgs(outputPath, fitPath, videoBitrate), Line, ct, work);
+            outputPath = fitPath;
+        }
         return (outputPath, thumbPath, outputDuration);
     }
 

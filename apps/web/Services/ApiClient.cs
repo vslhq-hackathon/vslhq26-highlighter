@@ -38,9 +38,23 @@ public sealed class ApiClient(IHttpClientFactory factory, AuthSession auth)
 
     // ---- actions ----
 
-    public Task<JobDto> ReviseAsync(Guid id, string request, CancellationToken ct = default) =>
+    public Task<JobDto> ReviseAsync(
+        Guid id, string request, bool fromChat = false, CancellationToken ct = default) =>
         SendAsync<JobDto>(() => JsonRequest(HttpMethod.Post, $"/api/projects/{id}/revise",
-            new ReviseRequestDto(request)), ct);
+            new ReviseRequestDto(request, fromChat)), ct);
+
+    // ---- agent chat ----
+
+    public Task<List<AgentMessageDto>> GetAgentMessagesAsync(
+        Guid id, string context = "long", CancellationToken ct = default) =>
+        GetAsync<List<AgentMessageDto>>($"/api/projects/{id}/agent/messages?context={context}", ct);
+
+    public Task<AgentMessageDto> PostAgentMessageAsync(
+        Guid id, string role, string text, string? jobId = null, string context = "long",
+        CancellationToken ct = default) =>
+        SendAsync<AgentMessageDto>(() => JsonRequest(HttpMethod.Post,
+            $"/api/projects/{id}/agent/messages?context={context}",
+            new { role, text, jobId }), ct);
 
     public Task<JobDto> PublishAsync(Guid id, PublishRequestDto request, CancellationToken ct = default) =>
         SendAsync<JobDto>(() => JsonRequest(HttpMethod.Post, $"/api/projects/{id}/publish", request), ct);

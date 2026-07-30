@@ -37,4 +37,8 @@ public interface IStudioBackend
 
     /// <summary>GET /api/jobs/{id}</summary>
     Task<string> GetJobStatusAsync(string jobId);
+
+    /// <summary>Re-arm the background watcher for a chat-started job (after a
+    /// reload) so its completion message lands in the open chat.</summary>
+    void WatchChatJob(string jobId);
 }

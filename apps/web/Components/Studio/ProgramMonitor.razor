@@ -68,22 +68,28 @@
         </div>
     </div>
     <div class="flex min-w-0 items-center gap-2.5 px-3.5 pb-3 pt-2">
-        <span class="min-w-0 shrink overflow-hidden font-mono text-[13px] tracking-[0.03em] text-accent">@Fmt.Timecode(E.Doc is null ? _playhead : E.PlayheadOutput)</span>
+        <span class="min-w-0 shrink overflow-hidden font-mono text-[13px] tracking-[0.03em] text-accent">@Fmt.Timecode(E.Doc is null ? _playhead : E.PlayheadOutput, E.Fps)</span>
         <div class="flex min-w-0 flex-1 items-center justify-center gap-2.5">
-            <span title="Mark in — trim the segment start to here" @onclick="E.MarkIn" class="cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟦</span>
-            <span title="Previous cut" @onclick="() => JumpSegment(-1)" class="cursor-pointer text-[13px] text-muted hover:text-fg">⏮</span>
-            <span title="Back one frame" @onclick="() => SeekBy(-1.0 / 30)" class="cursor-pointer text-[13px] text-muted hover:text-fg">◀</span>
-            <span @onclick="S.TogglePlay" class="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-fg text-xs text-ink hover:bg-white active:scale-90 @(MediaUrl is null ? "pointer-events-none opacity-40" : "")">@S.PlayIcon</span>
-            <span title="Forward one frame" @onclick="() => SeekBy(1.0 / 30)" class="cursor-pointer text-[13px] text-muted hover:text-fg">▶</span>
-            <span title="Next cut" @onclick="() => JumpSegment(1)" class="cursor-pointer text-[13px] text-muted hover:text-fg">⏭</span>
-            <span title="Mark out — trim the segment end to here" @onclick="E.MarkOut" class="cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟧</span>
+            <span title="Mark in — trim the segment start to here (I)" @onclick="E.MarkIn" class="cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟦</span>
+            <span title="Previous edit point (↑)" @onclick="() => E.JumpEdit(-1)" class="cursor-pointer text-[13px] text-muted hover:text-fg">⏮</span>
+            <span title="Back 5 seconds (PgUp / Alt+←)" @onclick="() => E.StepOutput(-5)" class="cursor-pointer font-mono text-[10.5px] text-muted hover:text-fg">«5</span>
+            <span title="Back one frame (←)" @onclick="() => SeekBy(-E.FrameStep)" class="cursor-pointer text-[13px] text-muted hover:text-fg">◀</span>
+            <span @onclick="TogglePlayButton" class="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-fg text-xs text-ink hover:bg-white active:scale-90 @(MediaUrl is null ? "pointer-events-none opacity-40" : "")">@S.PlayIcon</span>
+            @if (E.ShuttleRate is not 1)
+            {
+                <span class="rounded-[3px] border border-line2 px-1.5 py-0.5 font-mono text-[10px] text-accent">@(E.ShuttleRate < 0 ? $"◂×{Math.Abs(E.ShuttleRate):0.#}" : $"×{E.ShuttleRate:0.#}")</span>
+            }
+            <span title="Forward one frame (→)" @onclick="() => SeekBy(E.FrameStep)" class="cursor-pointer text-[13px] text-muted hover:text-fg">▶</span>
+            <span title="Forward 5 seconds (PgDn / Alt+→)" @onclick="() => E.StepOutput(5)" class="cursor-pointer font-mono text-[10.5px] text-muted hover:text-fg">5»</span>
+            <span title="Next edit point (↓)" @onclick="() => E.JumpEdit(1)" class="cursor-pointer text-[13px] text-muted hover:text-fg">⏭</span>
+            <span title="Mark out — trim the segment end to here (O)" @onclick="E.MarkOut" class="cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟧</span>
         </div>
         <div class="flex min-w-0 shrink items-center justify-end gap-2 overflow-hidden">
             <div class="flex h-4 shrink-0 items-end gap-0.5">
                 <div class="h-full w-[3px] bg-[linear-gradient(to_top,#5E6E33_0_62%,#D9F24B_62%_78%,#242220_78%)]"></div>
                 <div class="h-full w-[3px] bg-[linear-gradient(to_top,#5E6E33_0_48%,#D9F24B_48%_60%,#242220_60%)]"></div>
             </div>
-            <span class="whitespace-nowrap font-mono text-[11px] text-faint">@Fmt.Timecode(E.Doc is null ? _duration : E.OutputDuration)</span>
+            <span class="whitespace-nowrap font-mono text-[11px] text-faint">@Fmt.Timecode(E.Doc is null ? _duration : E.OutputDuration, E.Fps)</span>
         </div>
     </div>
 </div>
@@ -138,6 +144,7 @@
 
     private bool _disposed;
     private double _lastVolume = -1;
+    private double _lastShuttle = 1;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -155,6 +162,7 @@
                 _watchedSegments = segmentsJson;
                 await _module.InvokeVoidAsync("watch", _video, _self, SegmentsPayload());
                 _duration = await _module.InvokeAsync<double>("getDuration", _video);
+                _lastShuttle = 1; // watch() rebuilt the JS state
             }
             if (_duration <= 0)
                 _duration = await _module.InvokeAsync<double>("getDuration", _video);
@@ -173,6 +181,14 @@
             {
                 _wasPlaying = S.Playing;
                 await _module.InvokeVoidAsync("setPlaying", _video, S.Playing);
+            }
+
+            // After the play-state sync, so a reverse shuttle's scrub timer is
+            // installed on the (now paused) element rather than cleared by it.
+            if (Math.Abs(E.ShuttleRate - _lastShuttle) > 0.001)
+            {
+                _lastShuttle = E.ShuttleRate;
+                await _module.InvokeVoidAsync("setShuttle", _video, E.ShuttleRate);
             }
         }
         catch (Exception exception) when (exception
@@ -225,17 +241,11 @@
         }
     }
 
-    private void JumpSegment(int direction)
+    private void TogglePlayButton()
     {
-        if (E.Doc is null) return;
-        var layout = E.SegmentLayout();
-        if (layout.Count == 0) return;
-        var currentOut = E.PlayheadOutput;
-        var index = layout.FindLastIndex(entry => entry.OutStart <= currentOut + 0.05);
-        var target = Math.Clamp(index + direction, 0, layout.Count - 1);
-        // A hair inside the segment, so the playback loop can't mistake the
-        // boundary for a cut region.
-        E.RequestSeek(layout[target].Segment.SrcStart + 0.01);
+        // A manual play/pause always leaves shuttle mode.
+        if (E.ShuttleRate is not 1) E.SetShuttleRate(1);
+        S.TogglePlay();
     }
 
     public async ValueTask DisposeAsync()

@@ -13,8 +13,16 @@ public static class Defaults
     public const int DEFAULT_LLM_MARKER_SECONDS = 10;
     public const int DEFAULT_LLM_CONCURRENCY = 8;
     public const int DEFAULT_LLM_CONTEXT_SECONDS = 10;
+    // Azure Speech calls in flight (pure API latency, no local CPU): 2 keeps a
+    // healthy overlap without tripping the resource's rate limit.
+    public const int DEFAULT_TRANSCRIBE_CONCURRENCY = 2;
     public const double DEFAULT_CLIP_MERGE_GAP_SECONDS = 1.0;
     public const double DEFAULT_MAX_CLIP_SECONDS = 120;
+    // Editing-master handles: extra footage rendered on each side of a short
+    // clip so the editor can extend past the LLM's cut points. Must stay well
+    // under CHUNK_SECONDS — segment retirement keeps exactly one segment of
+    // slack behind each render.
+    public const double DEFAULT_CLIP_HANDLE_SECONDS = 5.0;
     // Auto-reframe frame sampling: one frame every this many seconds, plus one
     // just after each scene cut (0 disables the periodic frames).
     public const double DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS = 5.0;
@@ -32,11 +40,12 @@ public static class Defaults
     // Must be a template this machine's pycaps actually ships ("instagram" is
     // not one of them; pycaps aborts the captioned render if it's missing).
     public const string DEFAULT_CAPTION_TEMPLATE = "hype";
-    // Azure AI integration: Azure Speech transcription runs first with Deepgram
-    // as the fallback, and the Azure OpenAI deployments sit in every model chain
-    // (see Providers.cs for the per-role order). Reasoning-capable deployments
-    // run at the highest effort their family accepts (AZURE_REASONING_EFFORT
-    // overrides).
+    // Model routing: OpenRouter runs first in every chat-model chain (Gemini
+    // 3.1 Pro for editing/scoring, Sonnet 5 for research, the flash-image model
+    // for thumbnails) with the Azure OpenAI deployments as the fallback (see
+    // Providers.cs). Azure Speech transcription still runs first with Deepgram
+    // as the fallback. Reasoning-capable Azure deployments run at the highest
+    // effort their family accepts (AZURE_REASONING_EFFORT overrides).
     public const string DEFAULT_AZURE_SPEECH_LOCALE = "en-US";
     public const string DEFAULT_OUTPUT_ROOT = "outputs";
     // Empty by default: livestream source archiving to S3 is opt-in via S3_BUCKET.

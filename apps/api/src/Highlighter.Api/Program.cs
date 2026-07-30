@@ -161,6 +161,7 @@ IEndpointConventionBuilder[] gated =
 [
     app.MapProjectEndpoints(),
     app.MapProjectActionEndpoints(),
+    app.MapAgentChatEndpoints(),
     app.MapEditorEndpoints(),
     app.MapJobEndpoints(),
     app.MapAdminEndpoints(),

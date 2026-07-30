@@ -127,6 +127,8 @@ public static class Ingest
             throw new PipelineError("LLM_MARKER_SECONDS must be greater than 0");
         if (llmConcurrency <= 0)
             throw new PipelineError("LLM_CONCURRENCY must be greater than 0");
+        if (args.TranscribeConcurrency <= 0)
+            throw new PipelineError("TRANSCRIBE_CONCURRENCY must be greater than 0");
         if (llmContextSeconds < 0)
             throw new PipelineError("LLM_CONTEXT_SECONDS must be 0 or greater");
         if (chunkSeconds <= 2 * llmContextSeconds)
@@ -169,6 +171,16 @@ public static class Ingest
         string? archiveDir;
         var archivePrefix = "";
         var archivedSegments = new List<string>();
+        // Segment archiving runs on one background uploader thread (pure
+        // network) so a slow S3 round-trip never stalls the capture sweep.
+        // pendingUploads (under segmentsGate) keeps retirement from deleting a
+        // file the uploader is still reading; deferred deletes are the
+        // uploader's to finish. archivedSegments is also under segmentsGate.
+        var uploadQueue = new System.Collections.Concurrent
+            .BlockingCollection<(string Path, string Key, int Index)>();
+        var pendingUploads = new HashSet<int>();
+        var deferredDeletes = new HashSet<int>();
+        Thread? uploaderThread = null;
         // Local archive segments still on disk, shared across the forks; each
         // fork parks its own rendered-decisions (in Fork) until the segment(s)
         // their window needs have been archived. The gate guards mutations and
@@ -490,6 +502,65 @@ public static class Ingest
             // moves past them either way.
             archiveDir = args.NoArchive ? null : Path.Combine(projectDir, "source");
             archivePrefix = $"projects/{projectId}/source";
+            if (storage is not null)
+            {
+                // One background uploader (pure network) so a slow S3 round-trip
+                // never stalls the capture sweep between segments.
+                uploaderThread = new Thread(() =>
+                {
+                    foreach (var (path, key, index) in uploadQueue.GetConsumingEnumerable())
+                    {
+                        var uploaded = false;
+                        for (var attempt = 1; attempt <= 3 && !uploaded; attempt++)
+                        {
+                            try
+                            {
+                                storage.UploadFile(path, key);
+                                uploaded = true;
+                            }
+                            catch (Exception exc)
+                            {
+                                // The archive is best-effort; a failed segment
+                                // upload must not end the capture.
+                                Console.WriteLine(
+                                    $"Uploading video segment {index} to "
+                                    + $"s3://{storage.Bucket}/{key} failed"
+                                    + (attempt < 3
+                                        ? $" (attempt {attempt}/3, retrying): "
+                                        : " (giving up): ")
+                                    + exc.Message);
+                            }
+                        }
+                        bool deleteNow;
+                        lock (segmentsGate)
+                        {
+                            if (uploaded) archivedSegments.Add(key);
+                            pendingUploads.Remove(index);
+                            deleteNow = deferredDeletes.Remove(index);
+                        }
+                        if (uploaded)
+                            Console.WriteLine(
+                                $"Archived video segment {index} to s3://{storage.Bucket}/{key}");
+                        if (deleteNow)
+                        {
+                            try
+                            {
+                                File.Delete(path);
+                            }
+                            catch (IOException exc)
+                            {
+                                Console.WriteLine(
+                                    $"Could not delete local segment {path}: {exc.Message}");
+                            }
+                        }
+                    }
+                })
+                {
+                    IsBackground = true,
+                    Name = "s3-segment-uploader",
+                };
+                uploaderThread.Start();
+            }
             sourceContext = new JsonObject
             {
                 ["platform"] = platform,
@@ -645,11 +716,41 @@ public static class Ingest
                 var needed = NeededSegments(decision);
                 List<int> missing;
                 List<string>? segmentPaths = null;
+                List<string>? masterPaths = null;
+                double masterFirstStart = 0, masterStartSeconds = 0, masterEndSeconds = 0;
                 lock (segmentsGate)
                 {
                     missing = needed.Where(index => !segmentFiles.ContainsKey(index)).ToList();
                     if (missing.Count == 0)
+                    {
                         segmentPaths = needed.Select(index => segmentFiles[index]).ToList();
+                        if (fork.Mode == "short")
+                        {
+                            // Editing-master handles: pad the window into whatever
+                            // contiguous neighbor segments already exist. Never
+                            // waits on future segments — at the live edge the tail
+                            // handle honestly shrinks to the archived material.
+                            var start = JsonUtil.Double(decision["start_seconds"]);
+                            var end = JsonUtil.Double(decision["end_seconds"]);
+                            var (padFirst, padLast) = WindowSegmentRange(
+                                Math.Max(0, start - Defaults.DEFAULT_CLIP_HANDLE_SECONDS),
+                                end + Defaults.DEFAULT_CLIP_HANDLE_SECONDS,
+                                chunkSeconds,
+                                index => MeasuredSegmentStart(segmentStarts, index, chunkSeconds));
+                            var first = needed[0];
+                            while (first - 1 >= padFirst && segmentFiles.ContainsKey(first - 1)) first--;
+                            var last = needed[^1];
+                            while (last + 1 <= padLast && segmentFiles.ContainsKey(last + 1)) last++;
+                            masterFirstStart = MeasuredSegmentStart(segmentStarts, first, chunkSeconds);
+                            masterPaths = Enumerable.Range(first, last - first + 1)
+                                .Select(index => segmentFiles[index])
+                                .ToList();
+                            masterStartSeconds = Math.Max(
+                                masterFirstStart,
+                                Math.Max(0, start - Defaults.DEFAULT_CLIP_HANDLE_SECONDS));
+                            masterEndSeconds = end + Defaults.DEFAULT_CLIP_HANDLE_SECONDS;
+                        }
+                    }
                 }
                 if (missing.Count > 0)
                 {
@@ -681,13 +782,18 @@ public static class Ingest
                             JsonUtil.Double(decision["start_seconds"]),
                             JsonUtil.Double(decision["end_seconds"]))
                         : null,
-                    researchContext: fork.ResearchContext,
                     captionsEnabled: captionsEnabled && fork.ReframeEnabled,
-                    clipWords: captionsEnabled && fork.ReframeEnabled
+                    // Words feed the per-frame framing calls as well as captions,
+                    // so they ride along whenever the clip gets a vertical.
+                    clipWords: fork.ReframeEnabled
                         ? WordsInWindowLocked(
                             JsonUtil.Double(decision["start_seconds"]),
                             JsonUtil.Double(decision["end_seconds"]))
-                        : null);
+                        : null,
+                    masterSegmentPaths: masterPaths,
+                    masterFirstSegmentStartSeconds: masterFirstStart,
+                    masterStartSeconds: masterStartSeconds,
+                    masterEndSeconds: masterEndSeconds);
             }
 
             JsonArray WordsInWindowLocked(double startSeconds, double endSeconds)
@@ -749,7 +855,12 @@ public static class Ingest
                     var sharedBound = forks.Min(f => f.RetireBound);
                     foreach (var index in segmentFiles.Keys.Where(i => i <= sharedBound).ToList())
                     {
-                        stale.Add(segmentFiles[index]);
+                        // A file the uploader is still reading is the uploader's
+                        // to delete once it finishes.
+                        if (pendingUploads.Contains(index))
+                            deferredDeletes.Add(index);
+                        else
+                            stale.Add(segmentFiles[index]);
                         segmentFiles.Remove(index);
                     }
                 }
@@ -804,6 +915,19 @@ public static class Ingest
                     // A finished fork no longer holds any segment back.
                     fork.RetireBound = double.PositiveInfinity;
                 }
+            }
+
+            void DrainUploads()
+            {
+                // After this, pendingUploads is empty — deletions run plainly.
+                try
+                {
+                    uploadQueue.CompleteAdding();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                uploaderThread?.Join();
             }
 
             void DropRemainingSegments()
@@ -940,32 +1064,14 @@ public static class Ingest
                 }
                 if (storage is not null)
                 {
+                    // Hand the upload to the background uploader; the sweep
+                    // thread moves straight on to the next file.
                     var key = $"{archivePrefix}/{Path.GetFileName(segmentPath)}";
-                    var uploaded = false;
-                    for (var attempt = 1; attempt <= 3 && !uploaded; attempt++)
+                    lock (segmentsGate)
                     {
-                        try
-                        {
-                            storage.UploadFile(segmentPath, key);
-                            uploaded = true;
-                        }
-                        catch (Exception exc)
-                        {
-                            // The archive is best-effort; a failed segment upload
-                            // must not end the capture.
-                            Console.WriteLine(
-                                $"Uploading video segment {segmentIndex} to "
-                                + $"s3://{storage.Bucket}/{key} failed"
-                                + (attempt < 3 ? $" (attempt {attempt}/3, retrying): " : " (giving up): ")
-                                + exc.Message);
-                        }
+                        pendingUploads.Add(segmentIndex);
                     }
-                    if (uploaded)
-                    {
-                        archivedSegments.Add(key);
-                        Console.WriteLine(
-                            $"Archived video segment {segmentIndex} to s3://{storage.Bucket}/{key}");
-                    }
+                    uploadQueue.Add((segmentPath, key, segmentIndex));
                 }
                 if (coordinators.Count > 0)
                 {
@@ -979,14 +1085,25 @@ public static class Ingest
                 }
                 else
                 {
-                    try
+                    // No fork will render from this file — but the uploader may
+                    // still be reading it; hand it the delete in that case.
+                    bool deleteNow;
+                    lock (segmentsGate)
                     {
-                        File.Delete(segmentPath);
+                        deleteNow = !pendingUploads.Contains(segmentIndex);
+                        if (!deleteNow) deferredDeletes.Add(segmentIndex);
                     }
-                    catch (Exception exc) when (exc is IOException or UnauthorizedAccessException)
+                    if (deleteNow)
                     {
-                        Console.WriteLine(
-                            $"Could not delete local segment {segmentPath}: {exc.Message}");
+                        try
+                        {
+                            File.Delete(segmentPath);
+                        }
+                        catch (Exception exc) when (exc is IOException or UnauthorizedAccessException)
+                        {
+                            Console.WriteLine(
+                                $"Could not delete local segment {segmentPath}: {exc.Message}");
+                        }
                     }
                 }
             }
@@ -1010,17 +1127,20 @@ public static class Ingest
                     metadata["longform"] = JsonUtil.CloneObj(longformResult);
                 if (storage is not null)
                 {
-                    metadata["source_archive"] = new JsonObject
+                    lock (segmentsGate)
                     {
-                        ["bucket"] = storage.Bucket,
-                        ["region"] = storage.Region,
-                        ["prefix"] = archivePrefix,
-                        ["container"] = "mpegts",
-                        ["segment_seconds"] = chunkSeconds,
-                        ["segments"] = archivedSegments.Count,
-                        ["segment_keys"] = JsonUtil.Arr(
-                            archivedSegments.Select(key => (JsonNode?)key)),
-                    };
+                        metadata["source_archive"] = new JsonObject
+                        {
+                            ["bucket"] = storage.Bucket,
+                            ["region"] = storage.Region,
+                            ["prefix"] = archivePrefix,
+                            ["container"] = "mpegts",
+                            ["segment_seconds"] = chunkSeconds,
+                            ["segments"] = archivedSegments.Count,
+                            ["segment_keys"] = JsonUtil.Arr(
+                                archivedSegments.Select(key => (JsonNode?)key)),
+                        };
+                    }
                 }
                 return metadata;
             }
@@ -1060,6 +1180,11 @@ public static class Ingest
                 + ".");
 
             captureStarted = true;
+            // Transcription runs on this pool (pure API latency, no local CPU)
+            // so the sweep thread is free to hand over the next chunk instead
+            // of blocking on each Azure round-trip. Delivery — DB write, records
+            // append, coordinator AddChunk — stays strictly chunk-ordered.
+            var transcribePool = new TranscribePool(args.TranscribeConcurrency);
             try
             {
                 var chunkCount = Capture.CaptureAudioChunks(
@@ -1068,26 +1193,40 @@ public static class Ingest
                     chunkSeconds: chunkSeconds,
                     maxChunks: maxChunks,
                     streamlinkQuality: streamlinkQuality,
-                    onChunk: (audioPath, chunkIndex, startSeconds, endSeconds) => ProcessChunk(
-                        db: db,
-                        records: records!,
-                        projectId: projectId,
-                        audioPath: audioPath,
-                        chunkIndex: chunkIndex,
-                        startSeconds: startSeconds,
-                        endSeconds: endSeconds,
-                        deepgramModel: deepgramModel,
-                        coordinators: coordinators,
-                        sceneCuts: LockedCutsFor(chunkCuts, cutsGate, chunkIndex),
-                        wordSpans: wordSpans,
-                        spansGate: spansGate,
-                        chunkWords: chunkWords,
-                        wordsGate: wordsGate),
+                    onChunk: (audioPath, chunkIndex, startSeconds, endSeconds) =>
+                    {
+                        // Cuts snapshot on the sweep thread, BEFORE the async
+                        // hop: video segment N is processed before audio chunk
+                        // N, so the invariant "cuts precede their chunk" holds.
+                        var sceneCuts = LockedCutsFor(chunkCuts, cutsGate, chunkIndex);
+                        transcribePool.Submit(
+                            chunkIndex,
+                            work: () => TranscribeChunkSafe(
+                                audioPath, chunkIndex, startSeconds, endSeconds, deepgramModel),
+                            deliver: transcript => ProcessChunk(
+                                db: db,
+                                records: records!,
+                                projectId: projectId,
+                                audioPath: audioPath,
+                                chunkIndex: chunkIndex,
+                                startSeconds: startSeconds,
+                                endSeconds: endSeconds,
+                                transcript: transcript,
+                                coordinators: coordinators,
+                                sceneCuts: sceneCuts,
+                                wordSpans: wordSpans,
+                                spansGate: spansGate,
+                                chunkWords: chunkWords,
+                                wordsGate: wordsGate));
+                    },
                     downloader: downloader,
                     sourceType: sourceType,
                     archiveDir: archiveDir,
                     onVideoSegment: archiveDir is not null ? HandleVideoSegment : null,
                     shouldStop: StopRequestedPoll);
+                // Every chunk must be transcribed and delivered before the
+                // coordinators can drain.
+                transcribePool.Finish();
                 // Drains in-flight scoring, stitches, renders, and cleans up; on a
                 // cancel nothing new is dispatched but finished scores still land.
                 // Each Finish() blocks until that fork's emitter exits, so the
@@ -1108,6 +1247,7 @@ public static class Ingest
                         Console.WriteLine($"The {fork.Mode} fork failed while finishing: {exc.Message}");
                     }
                 }
+                DrainUploads();
                 DropRemainingSegments();
                 if (finishError is not null) throw finishError;
 
@@ -1208,6 +1348,7 @@ public static class Ingest
                 }
                 try
                 {
+                    DrainUploads();
                     DropRemainingSegments();
                 }
                 catch
@@ -1634,7 +1775,7 @@ public static class Ingest
             try
             {
                 var storageKey = $"projects/{projectId}/longform/{Path.GetFileName(outputPath)}";
-                var videoUrl = UploadVideoOrLocalUrl(
+                var videoUrl = Uploads.UploadVideoOrLocalUrl(
                     db, bucket: clipsBucket, key: storageKey, path: outputPath, label: "Long-form video");
                 result["bucket"] = clipsBucket;
                 result["storage_path"] = storageKey;
@@ -1719,46 +1860,6 @@ public static class Ingest
         return result;
     }
 
-    // Supabase storage rejects objects over the project's global size cap
-    // (~50 MB here) with a 413; renders bigger than this go to the API's
-    // local /media mirror instead of a doomed upload.
-    private const long MAX_STORAGE_UPLOAD_BYTES = 48L * 1024 * 1024;
-
-    /// <summary>URL for a render served from the API's /media mirror of
-    /// outputs/ (HIGHLIGHTER_MEDIA_BASE overrides the local default).</summary>
-    private static string LocalMediaUrl(string path)
-    {
-        var relative = Path
-            .GetRelativePath(Directory.GetCurrentDirectory(), Path.GetFullPath(path))
-            .Replace(Path.DirectorySeparatorChar, '/');
-        if (relative.StartsWith("outputs/")) relative = relative["outputs/".Length..];
-        var mediaBase = Environment.GetEnvironmentVariable("HIGHLIGHTER_MEDIA_BASE");
-        if (string.IsNullOrWhiteSpace(mediaBase)) mediaBase = "http://localhost:5199/media";
-        return $"{mediaBase.TrimEnd('/')}/{relative}";
-    }
-
-    /// <summary>Upload a rendered video, falling back to its local /media URL
-    /// when it exceeds the storage size cap or the upload fails. Never throws —
-    /// a failed upload must not cost the row that references the render.</summary>
-    private static string UploadVideoOrLocalUrl(
-        SupabaseClient db, string bucket, string key, string path, string label)
-    {
-        if (new FileInfo(path).Length > MAX_STORAGE_UPLOAD_BYTES)
-        {
-            Console.WriteLine($"{label} exceeds the storage size cap; serving via local /media.");
-            return LocalMediaUrl(path);
-        }
-        try
-        {
-            return db.UploadStorageObject(bucket: bucket, key: key, path: path);
-        }
-        catch (Exception exc)
-        {
-            Console.WriteLine($"{label} upload failed; serving via local /media: {exc.Message}");
-            return LocalMediaUrl(path);
-        }
-    }
-
     /// <summary>The thumbnail a longform_edits row shows: the selected generated
     /// variant when one was uploaded, else the midpoint frame.</summary>
     private static string? DisplayThumbnailUrl(JsonObject result)
@@ -1832,6 +1933,32 @@ public static class Ingest
         return null;
     }
 
+    /// <summary>The transcription pool's work function: never throws. A chunk
+    /// whose transcription fails entirely becomes an empty transcript — the
+    /// coordinator needs every index delivered, or later chunks strand behind
+    /// the gap.</summary>
+    private static JsonObject TranscribeChunkSafe(
+        string audioPath, int chunkIndex, int startSeconds, int endSeconds, string deepgramModel)
+    {
+        Console.WriteLine($"Transcribing chunk {chunkIndex} ({startSeconds}s-{endSeconds}s)");
+        try
+        {
+            return Transcribe.TranscribeAudioFile(audioPath, model: deepgramModel);
+        }
+        catch (Exception exc)
+        {
+            Console.WriteLine(
+                $"Transcription failed for chunk {chunkIndex}; storing an empty transcript: {exc.Message}");
+            return new JsonObject
+            {
+                ["transcript"] = "",
+                ["words"] = new JsonArray(),
+                ["metadata"] = new JsonObject { ["error"] = exc.Message },
+                ["backend"] = "failed",
+            };
+        }
+    }
+
     private static JsonObject StoreChunk(
         SupabaseClient? db,
         ProjectRecords records,
@@ -1840,11 +1967,9 @@ public static class Ingest
         int chunkIndex,
         int startSeconds,
         int endSeconds,
-        string deepgramModel,
+        JsonObject transcript,
         List<double>? sceneCuts = null)
     {
-        Console.WriteLine($"Transcribing chunk {chunkIndex} ({startSeconds}s-{endSeconds}s)");
-        var transcript = Transcribe.TranscribeAudioFile(audioPath, model: deepgramModel);
         var words = new JsonArray();
         foreach (var word in JsonUtil.Objects(transcript["words"]))
             words.Add(WithAbsoluteTimes(word, startSeconds));
@@ -1891,6 +2016,10 @@ public static class Ingest
         };
     }
 
+    /// <summary>The transcription pool's delivery callback: runs in strict
+    /// chunk order under the pool's delivery lock. Storage failures must not
+    /// stop AddChunk — the coordinators need every index or their reorder
+    /// buffers stall behind the gap.</summary>
     private static void ProcessChunk(
         SupabaseClient? db,
         ProjectRecords records,
@@ -1899,7 +2028,7 @@ public static class Ingest
         int chunkIndex,
         int startSeconds,
         int endSeconds,
-        string deepgramModel,
+        JsonObject transcript,
         List<ClipScoringCoordinator> coordinators,
         List<double>? sceneCuts,
         List<(double Start, double End)> wordSpans,
@@ -1907,16 +2036,33 @@ public static class Ingest
         Dictionary<int, JsonArray>? chunkWords = null,
         object? wordsGate = null)
     {
-        var stored = StoreChunk(
-            db: db,
-            records: records,
-            projectId: projectId,
-            audioPath: audioPath,
-            chunkIndex: chunkIndex,
-            startSeconds: startSeconds,
-            endSeconds: endSeconds,
-            deepgramModel: deepgramModel,
-            sceneCuts: sceneCuts);
+        JsonObject stored;
+        try
+        {
+            stored = StoreChunk(
+                db: db,
+                records: records,
+                projectId: projectId,
+                audioPath: audioPath,
+                chunkIndex: chunkIndex,
+                startSeconds: startSeconds,
+                endSeconds: endSeconds,
+                transcript: transcript,
+                sceneCuts: sceneCuts);
+        }
+        catch (Exception exc)
+        {
+            Console.WriteLine($"Storing chunk {chunkIndex} failed (scoring continues): {exc.Message}");
+            var words = new JsonArray();
+            foreach (var word in JsonUtil.Objects(transcript["words"]))
+                words.Add(WithAbsoluteTimes(word, startSeconds));
+            stored = new JsonObject
+            {
+                ["transcript"] = JsonUtil.Str(transcript["transcript"]),
+                ["words"] = words,
+                ["metadata"] = new JsonObject { ["store_error"] = exc.Message },
+            };
+        }
         lock (spansGate)
         {
             foreach (var word in JsonUtil.Objects(stored["words"]))
@@ -1963,9 +2109,12 @@ public static class Ingest
         bool reframeEnabled = false,
         double reframeInterval = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS,
         List<double>? sceneCuts = null,
-        JsonObject? researchContext = null,
         bool captionsEnabled = false,
-        JsonArray? clipWords = null)
+        JsonArray? clipWords = null,
+        List<string>? masterSegmentPaths = null,
+        double masterFirstSegmentStartSeconds = 0,
+        double masterStartSeconds = 0,
+        double masterEndSeconds = 0)
     {
         var filename = Render.ClipFilename(
             chunkIndex: JsonUtil.Int(decision["chunk_index"]),
@@ -1982,7 +2131,10 @@ public static class Ingest
                 outputPath: outputPath,
                 firstSegmentStartSeconds: firstSegmentStartSeconds,
                 startSeconds: JsonUtil.Double(decision["start_seconds"]),
-                endSeconds: JsonUtil.Double(decision["end_seconds"]));
+                endSeconds: JsonUtil.Double(decision["end_seconds"]),
+                // Short-fork clips are deliverables (and the vertical's source);
+                // long-fork clips are long-form assembly intermediates.
+                profile: pipeline == "short" ? EncodeProfile.Delivery : EncodeProfile.Working);
 
             renderResult = new JsonObject
             {
@@ -1990,20 +2142,31 @@ public static class Ingest
                 ["local_path"] = Path.GetRelativePath(Directory.GetCurrentDirectory(), outputPath),
                 ["filename"] = filename,
             };
-            var thumbnailPath = ExtractClipThumbnail(outputPath, decision);
-            string? verticalPath = null;
-            if (reframeEnabled)
-            {
-                var reframed = ReframeClip(
+            if (Render.ProbeFps(outputPath) is { } fps)
+                renderResult["fps"] = Py.Round(fps, 3);
+            // The reframe FRAMING call is pure vision-API latency: start it now
+            // so the thumbnail extraction and editing-master encode below hide
+            // most of the round-trip instead of waiting serially behind it.
+            var planTask = reframeEnabled
+                ? Task.Run(() => PlanReframe(
                     clipPath: outputPath,
                     decision: decision,
                     sceneCuts: sceneCuts,
-                    researchContext: researchContext,
-                    frameIntervalSeconds: reframeInterval);
-                if (reframed is not null)
+                    clipWords: clipWords,
+                    frameIntervalSeconds: reframeInterval))
+                : null;
+            var thumbnailPath = ExtractClipThumbnail(outputPath, decision);
+            if (masterSegmentPaths is not null && masterEndSeconds > masterStartSeconds)
+                RenderEditingMaster(
+                    renderResult, decision, outputPath,
+                    masterSegmentPaths, masterFirstSegmentStartSeconds,
+                    masterStartSeconds, masterEndSeconds);
+            string? verticalPath = null;
+            if (planTask?.GetAwaiter().GetResult() is { } cropTrack)
+            {
+                verticalPath = RenderVerticalFromPlan(outputPath, decision, cropTrack);
+                if (verticalPath is not null)
                 {
-                    var (path, cropTrack) = reframed.Value;
-                    verticalPath = path;
                     renderResult["vertical_path"] = Path.GetRelativePath(
                         Directory.GetCurrentDirectory(), verticalPath);
                     decision = JsonUtil.With(decision, ("reframe", cropTrack));
@@ -2031,9 +2194,12 @@ public static class Ingest
             }
             if (db is not null)
             {
+                var clipSeconds = JsonUtil.Double(decision["end_seconds"])
+                    - JsonUtil.Double(decision["start_seconds"]);
                 var storageKey = $"projects/{projectId}/clips/{filename}";
-                var videoUrl = UploadVideoOrLocalUrl(
-                    db, bucket: clipsBucket, key: storageKey, path: outputPath, label: "Clip");
+                var videoUrl = Uploads.UploadFittedOrLocalUrl(
+                    db, bucket: clipsBucket, key: storageKey, path: outputPath, label: "Clip",
+                    durationSeconds: clipSeconds);
                 renderResult["bucket"] = clipsBucket;
                 renderResult["storage_path"] = storageKey;
                 renderResult["video_url"] = videoUrl;
@@ -2056,19 +2222,29 @@ public static class Ingest
                 {
                     var verticalKey =
                         $"projects/{projectId}/clips/{Path.GetFileName(verticalPath)}";
-                    renderResult["vertical_url"] = UploadVideoOrLocalUrl(
+                    renderResult["vertical_url"] = Uploads.UploadFittedOrLocalUrl(
                         db, bucket: clipsBucket, key: verticalKey, path: verticalPath,
-                        label: "Vertical clip");
+                        label: "Vertical clip", durationSeconds: clipSeconds);
                     renderResult["vertical_storage_path"] = verticalKey;
                 }
                 if (captionedPath is not null)
                 {
                     var captionedKey =
                         $"projects/{projectId}/clips/{Path.GetFileName(captionedPath)}";
-                    renderResult["captioned_url"] = UploadVideoOrLocalUrl(
+                    renderResult["captioned_url"] = Uploads.UploadFittedOrLocalUrl(
                         db, bucket: clipsBucket, key: captionedKey, path: captionedPath,
-                        label: "Captioned clip");
+                        label: "Captioned clip", durationSeconds: clipSeconds);
                     renderResult["captioned_storage_path"] = captionedKey;
+                }
+                if (JsonUtil.StrOrNull(renderResult["master_filename"]) is { } masterFile)
+                {
+                    var masterKey = $"projects/{projectId}/clips/{masterFile}";
+                    renderResult["master_url"] = Uploads.UploadFittedOrLocalUrl(
+                        db, bucket: clipsBucket, key: masterKey,
+                        path: Path.Combine(Path.GetDirectoryName(outputPath)!, masterFile),
+                        label: "Editing master",
+                        durationSeconds: JsonUtil.Double(renderResult["master_duration_seconds"]));
+                    renderResult["master_storage_path"] = masterKey;
                 }
             }
 
@@ -2101,32 +2277,81 @@ public static class Ingest
             renderResult: renderResult);
     }
 
-    /// <summary>Best-effort blur-pad vertical next to the rendered clip. Returns
-    /// (verticalPath, cropTrack) or null — a reframe failure keeps the 16:9.</summary>
-    private static (string VerticalPath, JsonObject CropTrack)? ReframeClip(
+    /// <summary>Best-effort reframe FRAMING plan (frame sampling + one vision
+    /// call per frame — pure API latency, safe to overlap with the emitter's
+    /// ffmpeg work). Null on any failure — the clip keeps its 16:9.</summary>
+    private static JsonObject? PlanReframe(
         string clipPath,
         JsonObject decision,
         List<double>? sceneCuts,
-        JsonObject? researchContext,
+        JsonArray? clipWords,
         double frameIntervalSeconds = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS)
     {
         try
         {
-            var duration = JsonUtil.Double(decision["end_seconds"])
-                - JsonUtil.Double(decision["start_seconds"]);
+            var clipStart = JsonUtil.Double(decision["start_seconds"]);
+            var clipEnd = JsonUtil.Double(decision["end_seconds"]);
+            var duration = clipEnd - clipStart;
             var relativeCuts = (sceneCuts ?? new List<double>())
-                .Where(cut => JsonUtil.Double(decision["start_seconds"]) < cut
-                    && cut < JsonUtil.Double(decision["end_seconds"]))
-                .Select(cut => Py.Round(cut - JsonUtil.Double(decision["start_seconds"]), 2))
+                .Where(cut => clipStart < cut && cut < clipEnd)
+                .Select(cut => Py.Round(cut - clipStart, 2))
                 .ToList();
-            var cropTrack = Reframe.PlanCropTrack(
+            return Reframe.PlanCropTrack(
                 clipPath: clipPath,
                 clipDurationSeconds: duration,
                 sceneCuts: relativeCuts,
                 title: JsonUtil.Str(decision["title"]),
                 description: JsonUtil.Str(decision["description"]),
-                researchContext: researchContext,
+                transcriptWords: RelativeClipWords(clipWords, clipStart, clipEnd),
                 frameIntervalSeconds: frameIntervalSeconds);
+        }
+        catch (Exception exc)
+        {
+            Console.WriteLine(
+                $"Auto-reframe planning failed for chunk {JsonUtil.Str(decision["chunk_index"])} "
+                + $"(keeping the 16:9 clip): {exc.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>Clip-relative copies of the words overlapping the clip window,
+    /// in the {punctuated_word, start, end} shape Reframe.SpanWordsText reads.
+    /// Words carry project-absolute times (absolute_start/absolute_end, falling
+    /// back to start/end like Captions does).</summary>
+    private static JsonArray? RelativeClipWords(
+        JsonArray? clipWords, double clipStart, double clipEnd)
+    {
+        if (clipWords is null) return null;
+        var relative = new JsonArray();
+        foreach (var node in clipWords)
+        {
+            if (node is not JsonObject word) continue;
+            var startNode = word.ContainsKey("absolute_start")
+                ? word["absolute_start"]
+                : word["start"];
+            var endNode = word.ContainsKey("absolute_end") ? word["absolute_end"] : word["end"];
+            if (!JsonUtil.TryDouble(startNode, out var start)
+                || !JsonUtil.TryDouble(endNode, out var end))
+                continue;
+            if (end <= clipStart || start >= clipEnd) continue;
+            relative.Add(new JsonObject
+            {
+                ["punctuated_word"] = JsonUtil.StrOrNull(word["punctuated_word"])
+                    ?? JsonUtil.StrOrNull(word["word"]) ?? "",
+                ["start"] = Py.Round(Math.Max(0.0, start - clipStart), 3),
+                ["end"] = Py.Round(end - clipStart, 3),
+            });
+        }
+        return relative;
+    }
+
+    /// <summary>Best-effort blur-pad vertical from a framing plan; null on
+    /// failure (the clip keeps its 16:9).</summary>
+    private static string? RenderVerticalFromPlan(
+        string clipPath, JsonObject decision, JsonObject cropTrack)
+    {
+        try
+        {
             var verticalPath = Path.Combine(
                 Path.GetDirectoryName(clipPath)!,
                 $"{Path.GetFileNameWithoutExtension(clipPath)}_vertical.mp4");
@@ -2137,33 +2362,89 @@ public static class Ingest
             Console.WriteLine(
                 $"Reframed clip {JsonUtil.Str(decision["chunk_index"])} to {Path.GetFileName(verticalPath)} "
                 + $"({(cropTrack["keyframes"] as JsonArray)?.Count ?? 0} framing(s))");
-            return (verticalPath, cropTrack);
+            return verticalPath;
         }
         catch (Exception exc)
         {
             Console.WriteLine(
-                $"Auto-reframe failed for chunk {JsonUtil.Str(decision["chunk_index"])} "
+                $"Auto-reframe render failed for chunk {JsonUtil.Str(decision["chunk_index"])} "
                 + $"(keeping the 16:9 clip): {exc.Message}");
             return null;
         }
     }
 
-    /// <summary>Best-effort first-frame JPEG next to the rendered mp4; null on failure.</summary>
-    private static string? ExtractClipThumbnail(string clipPath, JsonObject decision)
+    /// <summary>Best-effort padded "editing master" next to the deliverable: the
+    /// clip window ±handle seconds, so the studio editor can extend past the
+    /// LLM's cut points. A failure only costs the extension feature — the
+    /// master_* keys are simply absent.</summary>
+    private static void RenderEditingMaster(
+        JsonObject renderResult,
+        JsonObject decision,
+        string clipPath,
+        List<string> masterSegmentPaths,
+        double masterFirstSegmentStartSeconds,
+        double masterStartSeconds,
+        double masterEndSeconds)
     {
         try
         {
-            var thumbnailPath = Path.ChangeExtension(clipPath, ".jpg");
-            Render.ExtractThumbnail(
-                clipPath: clipPath, outputPath: thumbnailPath, atSeconds: 0.0);
-            return thumbnailPath;
+            var masterFilename = Path.GetFileNameWithoutExtension(clipPath) + "_master.mp4";
+            var masterPath = Path.Combine(Path.GetDirectoryName(clipPath)!, masterFilename);
+            Render.RenderClipFromSegments(
+                segmentPaths: masterSegmentPaths,
+                outputPath: masterPath,
+                firstSegmentStartSeconds: masterFirstSegmentStartSeconds,
+                startSeconds: masterStartSeconds,
+                endSeconds: masterEndSeconds,
+                profile: EncodeProfile.Delivery);
+            // ffmpeg truncates at the end of the archived material, so probe the
+            // real duration and report the pads the master actually carries.
+            var duration = Render.ProbeDuration(masterPath)
+                ?? (masterEndSeconds - masterStartSeconds);
+            var start = JsonUtil.Double(decision["start_seconds"]);
+            var end = JsonUtil.Double(decision["end_seconds"]);
+            renderResult["master_filename"] = masterFilename;
+            renderResult["master_local_path"] =
+                Path.GetRelativePath(Directory.GetCurrentDirectory(), masterPath);
+            renderResult["master_pad_start"] = Py.Round(Math.Max(0, start - masterStartSeconds), 3);
+            renderResult["master_pad_end"] =
+                Py.Round(Math.Max(0, duration - (end - masterStartSeconds)), 3);
+            renderResult["master_duration_seconds"] = Py.Round(duration, 3);
+            Console.WriteLine(
+                $"Rendered editing master {masterFilename} "
+                + $"(+{JsonUtil.Str(renderResult["master_pad_start"])}s / "
+                + $"+{JsonUtil.Str(renderResult["master_pad_end"])}s handles)");
         }
         catch (Exception exc)
         {
-            Console.WriteLine(
-                $"Thumbnail extraction failed for {Path.GetFileName(clipPath)} (non-fatal): {exc.Message}");
-            return null;
+            Console.WriteLine($"Editing-master render failed (non-fatal): {exc.Message}");
         }
+    }
+
+    /// <summary>Best-effort midpoint-frame JPEG next to the rendered mp4; null on
+    /// failure. The midpoint, not t=0 — clips often open on a black transition
+    /// frame, which made preview cards look like the thumbnail never rendered.</summary>
+    private static string? ExtractClipThumbnail(string clipPath, JsonObject decision)
+    {
+        var thumbnailPath = Path.ChangeExtension(clipPath, ".jpg");
+        var midpoint = Math.Max(0.0, (JsonUtil.Double(decision["end_seconds"])
+            - JsonUtil.Double(decision["start_seconds"])) / 2);
+        foreach (var atSeconds in new[] { midpoint, 0.0 })
+        {
+            try
+            {
+                Render.ExtractThumbnail(
+                    clipPath: clipPath, outputPath: thumbnailPath, atSeconds: atSeconds);
+                return thumbnailPath;
+            }
+            catch (Exception exc)
+            {
+                Console.WriteLine(
+                    $"Thumbnail extraction at {atSeconds:0.##}s failed for "
+                    + $"{Path.GetFileName(clipPath)} (non-fatal): {exc.Message}");
+            }
+        }
+        return null;
     }
 
     private static void StoreClipDecision(

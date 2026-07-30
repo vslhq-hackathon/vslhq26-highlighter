@@ -7,6 +7,10 @@ namespace Highlighter.Api.Services;
 
 public enum JobState { Starting, Running, Succeeded, Failed, Killed }
 
+/// <summary>Marks a job as chat-started: when it ends, the supervisor writes a
+/// completion message into agent_messages for this project + chat context.</summary>
+public sealed record AgentChatRef(Guid ProjectId, string Context);
+
 /// <summary>One tracked worker process: state machine, in-memory log window,
 /// durable file sink, and live subscriber fan-out. Mutations run under one gate;
 /// a slow SSE subscriber can never block the pumps (bounded channels, DropOldest).</summary>
@@ -49,6 +53,9 @@ public sealed class PipelineJob
     public bool KillRequested { get; private set; }
 
     internal Process? Process { get; set; }
+
+    /// <summary>Set when the studio agent started this job from chat.</summary>
+    internal AgentChatRef? AgentChat { get; set; }
 
     /// <summary>In-process jobs have no OS process to signal; force-cancel
     /// cancels this instead.</summary>

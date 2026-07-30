@@ -101,41 +101,51 @@ public static class Thumbnails
         var referenceImages = ReferenceImages(longformPath, entries);
 
         Directory.CreateDirectory(outputDir);
-        var variants = new JsonArray();
+        // The variants are independent image-API calls (pure network latency) —
+        // generate them together; per-variant retry and non-fatal failure
+        // semantics are unchanged, and variants keep their concept order.
+        var generated = new JsonObject?[concepts.Count];
+        var tasks = new List<Task>();
         for (var offset = 0; offset < concepts.Count; offset++)
         {
-            var number = startIndex + offset;
-            var concept = concepts[offset];
+            var slot = offset;
+            var number = startIndex + slot;
+            var concept = concepts[slot];
             var prompt = ImagePrompt(concept, title);
-            string outputPath;
-            try
+            tasks.Add(Task.Run(() =>
             {
-                (byte[] Bytes, string Extension) image;
                 try
                 {
-                    image = GenerateImage(prompt, referenceImages);
+                    (byte[] Bytes, string Extension) image;
+                    try
+                    {
+                        image = GenerateImage(prompt, referenceImages);
+                    }
+                    catch
+                    {
+                        Thread.Sleep(TimeSpan.FromSeconds(IMAGE_RETRY_SECONDS));
+                        image = GenerateImage(prompt, referenceImages);
+                    }
+                    var outputPath = Path.Combine(outputDir, $"thumbnail_{number}{image.Extension}");
+                    File.WriteAllBytes(outputPath, image.Bytes);
+                    generated[slot] = new JsonObject
+                    {
+                        ["index"] = number,
+                        ["direction"] = JsonUtil.C(concept["direction"]),
+                        ["overlay_text"] = JsonUtil.C(concept["overlay_text"]),
+                        ["local_path"] = outputPath,
+                    };
                 }
-                catch
+                catch (Exception exc)
                 {
-                    Thread.Sleep(TimeSpan.FromSeconds(IMAGE_RETRY_SECONDS));
-                    image = GenerateImage(prompt, referenceImages);
+                    Console.WriteLine($"Thumbnail {number} generation failed (non-fatal): {exc.Message}");
                 }
-                outputPath = Path.Combine(outputDir, $"thumbnail_{number}{image.Extension}");
-                File.WriteAllBytes(outputPath, image.Bytes);
-            }
-            catch (Exception exc)
-            {
-                Console.WriteLine($"Thumbnail {number} generation failed (non-fatal): {exc.Message}");
-                continue;
-            }
-            variants.Add(new JsonObject
-            {
-                ["index"] = number,
-                ["direction"] = JsonUtil.C(concept["direction"]),
-                ["overlay_text"] = JsonUtil.C(concept["overlay_text"]),
-                ["local_path"] = outputPath,
-            });
+            }));
         }
+        Task.WaitAll(tasks.ToArray());
+        var variants = new JsonArray();
+        foreach (var variant in generated)
+            if (variant is not null) variants.Add(variant);
 
         if (variants.Count == 0) return null;
         var selected = Random.Shared.Next(variants.Count);
@@ -283,6 +293,8 @@ public static class Thumbnails
     /// metadata.</summary>
     public static string ThumbnailModelLabel()
     {
+        if (!string.IsNullOrEmpty(Config.Env("OPENROUTER_API_KEY")))
+            return Defaults.DEFAULT_THUMBNAIL_MODEL;
         var azure = AzureImageConfig();
         return azure is not null ? azure.Value.Deployment : Defaults.DEFAULT_THUMBNAIL_MODEL;
     }
@@ -293,36 +305,42 @@ public static class Thumbnails
 
     /// <summary>Render one thumbnail image. Returns (image bytes, file extension).
     ///
-    /// Model resolution, kept here in one place: the Azure-hosted image
-    /// deployment (gpt-image-2) takes the call whenever one is configured —
-    /// AZURE_IMAGE_DEPLOYMENT or AZURE_OPENAI_IMAGE_DEPLOYMENT, with
-    /// AZURE_IMAGE_ENDPOINT/AZURE_IMAGE_KEY overriding the shared Azure OpenAI
-    /// endpoint and key — using images/edits when reference frames exist and
-    /// images/generations when none survived extraction. When no deployment is
-    /// configured, or the Azure call fails, the render falls through to Nano
-    /// Banana 2 (google/gemini-3.1-flash-image) pinned to Google Vertex through
-    /// OpenRouter's chat API, which returns images as data URIs. Callers only
-    /// ever see this one function.</summary>
+    /// Model resolution, kept here in one place: Nano Banana 2
+    /// (google/gemini-3.1-flash-image) pinned to Google Vertex through
+    /// OpenRouter's chat API takes the call whenever OPENROUTER_API_KEY is set
+    /// (images come back as data URIs). When OpenRouter is unconfigured or the
+    /// call fails, the render falls through to the Azure-hosted image
+    /// deployment (gpt-image-2) when one is configured — AZURE_IMAGE_DEPLOYMENT
+    /// or AZURE_OPENAI_IMAGE_DEPLOYMENT, with AZURE_IMAGE_ENDPOINT/
+    /// AZURE_IMAGE_KEY overriding the shared Azure OpenAI endpoint and key —
+    /// using images/edits when reference frames exist and images/generations
+    /// when none survived extraction. Callers only ever see this one
+    /// function.</summary>
     private static (byte[] Bytes, string Extension) GenerateImage(
         string prompt, IReadOnlyList<string> referenceImages)
     {
         var azure = AzureImageConfig();
-        if (azure is not null)
+        if (!string.IsNullOrEmpty(Config.Env("OPENROUTER_API_KEY")))
         {
             try
             {
-                return AzureImage(
-                    prompt, referenceImages,
-                    azure.Value.Endpoint, azure.Value.Key, azure.Value.Deployment);
+                return NanoBananaImage(prompt, referenceImages);
             }
-            catch (Exception exc)
+            catch (Exception exc) when (azure is not null)
             {
                 Console.WriteLine(
-                    $"Azure OpenAI ({azure.Value.Deployment}) image call failed; "
-                    + $"falling back to {Defaults.DEFAULT_THUMBNAIL_MODEL}: {exc.Message}");
+                    $"{Defaults.DEFAULT_THUMBNAIL_MODEL} image call failed; falling back to "
+                    + $"Azure OpenAI ({azure.Value.Deployment}): {exc.Message}");
             }
         }
-        return NanoBananaImage(prompt, referenceImages);
+        if (azure is null)
+        {
+            // No OpenRouter key either — surfaces the missing-config error.
+            return NanoBananaImage(prompt, referenceImages);
+        }
+        return AzureImage(
+            prompt, referenceImages,
+            azure.Value.Endpoint, azure.Value.Key, azure.Value.Deployment);
     }
 
     private static (string Endpoint, string Key, string Deployment)? AzureImageConfig()

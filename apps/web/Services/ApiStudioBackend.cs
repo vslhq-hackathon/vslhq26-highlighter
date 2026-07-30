@@ -125,8 +125,12 @@ public class ApiStudioBackend(StudioState state, ApiClient api) : IStudioBackend
         if (state.ProjectId is not { } id) return "No project is open.";
         try
         {
-            var job = await api.ReviseAsync(id, request);
-            WatchJob(job.Id, refreshOnExit: true);
+            var fromChat = state.AgentContext == "long";
+            var job = await api.ReviseAsync(id, request, fromChat);
+            // The persisted assistant reply carries this job id, so the server
+            // can pair its completion row with the message that started it.
+            if (fromChat) state.PendingAgentJobId = job.Id;
+            WatchJob(job.Id, refreshOnExit: true, chatJob: fromChat);
             return $"Revision started (job {job.Id}). It renders the next long-form version — "
                 + "usually a few minutes; check with get_job_status.";
         }
@@ -176,9 +180,13 @@ public class ApiStudioBackend(StudioState state, ApiClient api) : IStudioBackend
         }
     }
 
+    public void WatchChatJob(string jobId) => WatchJob(jobId, refreshOnExit: true, chatJob: true);
+
     /// <summary>Background watcher: when a render job ends, refresh the open
-    /// project so new media/thumbnails appear without a manual reload.</summary>
-    private void WatchJob(string jobId, bool refreshOnExit, bool thumbJob = false)
+    /// project so new media/thumbnails appear without a manual reload — and for
+    /// chat-started jobs, re-pull the transcript so the server-written
+    /// completion message appears in the open chat.</summary>
+    private void WatchJob(string jobId, bool refreshOnExit, bool thumbJob = false, bool chatJob = false)
     {
         _ = Task.Run(async () =>
         {
@@ -193,6 +201,7 @@ public class ApiStudioBackend(StudioState state, ApiClient api) : IStudioBackend
                         state.SetThumbJob(false,
                             job.State == "succeeded" ? null : $"Generation {job.State}");
                     if (refreshOnExit) await state.RefreshDetailAsync();
+                    if (chatJob) await RefreshChatAsync(jobId);
                     return;
                 }
                 if (thumbJob) state.SetThumbJob(false, "Generation timed out");
@@ -202,5 +211,31 @@ public class ApiStudioBackend(StudioState state, ApiClient api) : IStudioBackend
                 if (thumbJob) state.SetThumbJob(false);
             }
         });
+    }
+
+    /// <summary>The supervisor writes the completion row on job exit; give it a
+    /// few beats to land, then swap the transcript in.</summary>
+    private async Task RefreshChatAsync(string jobId)
+    {
+        if (state.ProjectId is not { } id) return;
+        for (var attempt = 0; attempt < 6; attempt++)
+        {
+            try
+            {
+                var rows = await api.GetAgentMessagesAsync(id);
+                if (rows.Any(row => row.JobId == jobId && row.JobFinal))
+                {
+                    state.ReplaceAgentMessages(rows.Select(row =>
+                        new AgentChatMessage(row.Role, row.Text, row.JobId, row.JobFinal)));
+                    return;
+                }
+            }
+            catch (ApiException)
+            {
+                // Token expired or circuit signing out — stop quietly.
+                return;
+            }
+            await Task.Delay(TimeSpan.FromSeconds(2));
+        }
     }
 }

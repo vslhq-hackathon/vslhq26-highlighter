@@ -84,7 +84,8 @@ public static class ProjectActionEndpoints
                         "No rendered long-form edit exists for this project");
 
                 var job = jobs.Start("revise", id, WorkerArgs.Revise(id, body.Request.Trim()),
-                    ownerId: AuthHelpers.Uid(user));
+                    ownerId: AuthHelpers.Uid(user),
+                    agentChat: body.FromChat ? new AgentChatRef(id, "long") : null);
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("ReviseProject");

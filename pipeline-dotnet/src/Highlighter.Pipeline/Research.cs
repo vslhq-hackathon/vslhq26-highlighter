@@ -6,9 +6,9 @@ namespace Highlighter.Pipeline;
 ///
 /// Content research layer: one research call per run, specialized per mode.
 ///
-/// The Azure OpenAI editor deployment takes the first attempt when configured;
-/// otherwise (or on any failure) the call runs as a single web-grounded Claude
-/// Sonnet 5 request through OpenRouter's web-search plugin. Either way the
+/// The call runs first as a single web-grounded Claude Sonnet 5 request
+/// through OpenRouter's web-search plugin; the Azure OpenAI editor deployment
+/// takes over when OpenRouter is unconfigured or fails. Either way the
 /// result is structured, source-cited editorial context that feeds the editing
 /// models as researchContext. The prompt and schema are specialized per
 /// pipeline mode: short form researches clip formats, hooks, and platform
@@ -156,10 +156,11 @@ public static class Research
 
     public static string ResearchBackendLabel()
     {
-        var provider = Providers.AzureEditorProvider();
-        return provider is not null
-            ? $"{provider.Label} (fallback: web-grounded {Defaults.DEFAULT_RESEARCH_MODEL})"
-            : $"web-grounded {Defaults.DEFAULT_RESEARCH_MODEL}";
+        var azure = Providers.AzureEditorProvider();
+        var primary = $"web-grounded {Defaults.DEFAULT_RESEARCH_MODEL}";
+        if (string.IsNullOrEmpty(Config.Env("OPENROUTER_API_KEY")))
+            return azure?.Label ?? primary;
+        return azure is not null ? $"{primary} (fallback: {azure.Label})" : primary;
     }
 
     /// <summary>Run the research call and return an object matching
@@ -176,22 +177,26 @@ public static class Research
             pipelineMode: pipelineMode,
             userInstructions: userInstructions);
         var systemPrompt = ResearchSystemPrompt(pipelineMode);
-        var provider = Providers.AzureEditorProvider();
-        if (provider is not null)
+        var azure = Providers.AzureEditorProvider();
+        if (!string.IsNullOrEmpty(Config.Env("OPENROUTER_API_KEY")))
         {
             try
             {
-                return RequestAzureResearch(
-                    provider, prompt, systemPrompt, ResearchSchema(pipelineMode));
+                return WebGroundedResearch(prompt, model, systemPrompt);
             }
-            catch (Exception exc)
+            catch (Exception exc) when (azure is not null)
             {
                 Console.WriteLine(
-                    $"{provider.Label} research failed; falling back to "
-                    + $"web-grounded {model}: {exc.Message}");
+                    $"Web-grounded {model} research failed; falling back to "
+                    + $"{azure.Label}: {exc.Message}");
             }
         }
-        return WebGroundedResearch(prompt, model, systemPrompt);
+        if (azure is null)
+        {
+            // Mirrors WebGroundedResearch's config error for the nothing-set case.
+            throw new PipelineError("OPENROUTER_API_KEY is required for content research");
+        }
+        return RequestAzureResearch(azure, prompt, systemPrompt, ResearchSchema(pipelineMode));
     }
 
     private static string ResearchPrompt(

@@ -50,6 +50,43 @@
                         OnChange="v => S.Edit.UpdateTextOverlay(text.Id, y: v)" />
             }
 
+            @if (S.ActiveClip is not null)
+            {
+                <div class="mb-3.5 border-t border-line pt-3">
+                    <div class="mb-[7px] flex items-center justify-between text-xs">
+                        <span class="font-semibold text-soft">Extend clip</span>
+                        @if (S.Edit.Meta?.Handles is not null)
+                        {
+                            <span class="font-mono text-[9.5px] text-faint">handle material</span>
+                        }
+                    </div>
+                    @if (S.Edit.Meta?.Handles is not null)
+                    {
+                        <div class="flex flex-col gap-1.5">
+                            <div class="flex items-center justify-between text-[11.5px]">
+                                <span class="text-muted">Start <span class="font-mono text-[10px] text-faint">(@($"{S.Edit.AvailableLead:0.0}s") left)</span></span>
+                                <span class="flex overflow-hidden rounded border border-line2">
+                                    <span @onclick="() => S.Edit.ExtendStart(1)" class="px-2 py-[3px] @(S.Edit.AvailableLead > 0.05 ? "cursor-pointer text-soft hover:bg-well hover:text-fg" : "pointer-events-none text-ghost")">−1s</span>
+                                    <span @onclick="() => S.Edit.ExtendStart(5)" class="border-l border-line2 px-2 py-[3px] @(S.Edit.AvailableLead > 0.05 ? "cursor-pointer text-soft hover:bg-well hover:text-fg" : "pointer-events-none text-ghost")">−5s</span>
+                                </span>
+                            </div>
+                            <div class="flex items-center justify-between text-[11.5px]">
+                                <span class="text-muted">End <span class="font-mono text-[10px] text-faint">(@($"{S.Edit.AvailableTail:0.0}s") left)</span></span>
+                                <span class="flex overflow-hidden rounded border border-line2">
+                                    <span @onclick="() => S.Edit.ExtendEnd(1)" class="px-2 py-[3px] @(S.Edit.AvailableTail > 0.05 ? "cursor-pointer text-soft hover:bg-well hover:text-fg" : "pointer-events-none text-ghost")">+1s</span>
+                                    <span @onclick="() => S.Edit.ExtendEnd(5)" class="border-l border-line2 px-2 py-[3px] @(S.Edit.AvailableTail > 0.05 ? "cursor-pointer text-soft hover:bg-well hover:text-fg" : "pointer-events-none text-ghost")">+5s</span>
+                                </span>
+                            </div>
+                            <div class="text-[10px] leading-[1.5] text-faint">Pulls footage the pipeline kept around the cut — fix an early or late cut point, then trim as usual.</div>
+                        </div>
+                    }
+                    else
+                    {
+                        <div class="text-[10.5px] leading-[1.5] text-faint">Extension needs handle material around the cut — available for clips rendered after this update.</div>
+                    }
+                </div>
+            }
+
             @if (S.Edit.Doc is { } doc)
             {
                 <Slider Label="Zoom" Value="@doc.Transform.Scale" Min="1" Max="3" Step="0.05"
@@ -156,10 +193,10 @@
         ? "The wide 16:9 ships clean — captions are burned on the vertical and square renders."
         : "Captions weren't rendered for this clip.";
 
-    void OpenPanel(string key)
+    async Task OpenPanel(string key)
     {
         S.SetPanel(key);
-        if (key == "agent") Agent.SeedContext();
+        if (key == "agent") await Agent.SeedContextAsync();
     }
 
     async Task SendToAgent()

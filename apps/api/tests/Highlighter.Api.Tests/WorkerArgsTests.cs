@@ -48,6 +48,20 @@ public class WorkerArgsTests
     }
 
     [Fact]
+    public void Ingest_PassesConcurrencyFlagsOnlyWhenConfigured()
+    {
+        var request = new CreateProjectRequest("https://x", "short");
+
+        var bare = WorkerArgs.Ingest(Id, request);
+        Assert.DoesNotContain("--llm-concurrency", bare);
+        Assert.DoesNotContain("--transcribe-concurrency", bare);
+
+        var tuned = WorkerArgs.Ingest(Id, request, llmConcurrency: 12, transcribeConcurrency: 3);
+        Assert.Equal("12", tuned[tuned.IndexOf("--llm-concurrency") + 1]);
+        Assert.Equal("3", tuned[tuned.IndexOf("--transcribe-concurrency") + 1]);
+    }
+
+    [Fact]
     public void Ingest_NeverPassesSourceUrlOrMinClipScore()
     {
         // In attach mode the project row's values win — the API must not compete.

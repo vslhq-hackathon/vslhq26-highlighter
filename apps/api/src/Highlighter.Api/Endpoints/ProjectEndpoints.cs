@@ -43,8 +43,11 @@ public static class ProjectEndpoints
 
                 try
                 {
-                    jobs.Start("ingest", projectId, WorkerArgs.Ingest(projectId, request), jobId,
-                        AuthHelpers.Uid(user));
+                    jobs.Start("ingest", projectId,
+                        WorkerArgs.Ingest(projectId, request,
+                            llmConcurrency: EnvInt("LLM_CONCURRENCY"),
+                            transcribeConcurrency: EnvInt("TRANSCRIBE_CONCURRENCY")),
+                        jobId, AuthHelpers.Uid(user));
                 }
                 catch (WorkerUnavailableException exception)
                 {
@@ -275,6 +278,13 @@ public static class ProjectEndpoints
     private static string? ActiveJobId(PipelineJobService jobs, JsonObject row) =>
         Guid.TryParse(row["id"]?.GetValue<string>(), out var id)
             ? jobs.ActiveJobIdForProject(id)
+            : null;
+
+    /// <summary>Concurrency knobs live in .env; passing them as explicit worker
+    /// flags keeps API-triggered runs identical to manual CLI runs.</summary>
+    private static int? EnvInt(string key) =>
+        int.TryParse(Environment.GetEnvironmentVariable(key), out var value) && value > 0
+            ? value
             : null;
 
     internal static IResult NotFound(Guid id) =>

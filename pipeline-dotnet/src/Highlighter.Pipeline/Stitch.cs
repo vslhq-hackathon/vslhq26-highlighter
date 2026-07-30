@@ -40,8 +40,14 @@ public static class Stitch
     private static (int Code, string Stdout, string Stderr) RunFfmpeg(
         string concatList, string outputPath, bool reencode)
     {
+        // The re-encode fallback fires exactly when clip resolutions differ
+        // mid-VOD, so it also normalizes everything to the 720p working cap.
         var codecArgs = reencode
-            ? new[] { "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "128k" }
+            ? new[]
+            {
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+                "-vf", "scale='min(720,iw)':-2", "-c:a", "aac", "-b:a", "128k",
+            }
             : new[] { "-c", "copy" };
         var command = new List<string>
         {

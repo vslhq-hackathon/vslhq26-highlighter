@@ -241,8 +241,8 @@ public static class Verbs
         {
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-i", clipPath,
-            "-vf", $"crop=ih:ih,scale={SQUARE_SIZE}:{SQUARE_SIZE}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-vf", $"crop=ih:ih,scale={SQUARE_SIZE}:{SQUARE_SIZE},setsar=1",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             outputPath,
@@ -334,17 +334,22 @@ public static class Verbs
         {
             var bucket = Config.Env(
                 "SUPABASE_CLIPS_BUCKET", Defaults.DEFAULT_SUPABASE_CLIPS_BUCKET)!;
+            var clipSeconds = JsonUtil.Double(row["end_seconds"])
+                - JsonUtil.Double(row["start_seconds"]);
             var fields = new JsonObject();
             try
             {
                 var key = $"projects/{projectId}/clips/{Path.GetFileName(squarePath)}";
-                render["square_url"] = db.UploadStorageObject(bucket, key, squarePath);
+                render["square_url"] = Uploads.UploadFittedOrLocalUrl(
+                    db, bucket, key, squarePath, label: "Square clip",
+                    durationSeconds: clipSeconds);
                 render["square_storage_path"] = key;
                 if (captionedPath is not null)
                 {
                     var captionedKey = $"projects/{projectId}/clips/{Path.GetFileName(captionedPath)}";
-                    render["square_captioned_url"] =
-                        db.UploadStorageObject(bucket, captionedKey, captionedPath);
+                    render["square_captioned_url"] = Uploads.UploadFittedOrLocalUrl(
+                        db, bucket, captionedKey, captionedPath, label: "Square captioned clip",
+                        durationSeconds: clipSeconds);
                     render["square_captioned_storage_path"] = captionedKey;
                 }
                 var mergedMetadata = JsonUtil.CloneObj(metadata);

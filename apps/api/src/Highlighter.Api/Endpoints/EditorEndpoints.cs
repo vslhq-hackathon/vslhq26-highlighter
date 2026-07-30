@@ -40,7 +40,7 @@ public static class EditorEndpoints
                 if (row is null)
                     return Problem(404, "Clip not found", $"No clip {clipId} in project {id}");
                 var doc = EditorDocs.Normalize(body.Doc);
-                if (EditorDocs.Validate(doc, ClipDuration(row)) is { } invalid)
+                if (EditorDocs.Validate(doc, EffectiveSourceDuration(row)) is { } invalid)
                     return Problem(400, "Invalid document", invalid);
 
                 var saved = await new EditorStore(db).SaveClipDocAsync(id, clipId, doc, ct);
@@ -62,7 +62,7 @@ public static class EditorEndpoints
                 var doc = body?.Doc is null ? null : EditorDocs.Normalize(body.Doc);
                 if (doc is not null)
                 {
-                    if (EditorDocs.Validate(doc, ClipDuration(row)) is { } invalid)
+                    if (EditorDocs.Validate(doc, EffectiveSourceDuration(row)) is { } invalid)
                         return Problem(400, "Invalid document", invalid);
                     row = await new EditorStore(db).SaveClipDocAsync(id, clipId, doc, ct) ?? row;
                 }
@@ -72,10 +72,12 @@ public static class EditorEndpoints
                         "No saved editor document — save (or pass) one first");
 
                 var clip = ProjectShaper.Clip(row);
-                if (clip.VerticalUrl is null && clip.VideoUrl is null && clip.CaptionedUrl is null)
+                var master = EditorStore.ClipMaster(row);
+                if (master is null
+                    && clip.VerticalUrl is null && clip.VideoUrl is null && clip.CaptionedUrl is null)
                     return Problem(409, "Clip not exportable", "The clip has no rendered media yet");
 
-                var job = exports.StartClipExport(id, clip, doc, AuthHelpers.Uid(user));
+                var job = exports.StartClipExport(id, clip, doc, master, AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("ExportClipEdit");
@@ -153,6 +155,12 @@ public static class EditorEndpoints
         return Math.Max(0, end - start);
     }
 
+    /// <summary>What the doc's source seconds run against: the padded master's
+    /// duration when one exists (its handles are legal timeline material), else
+    /// the bare clip length.</summary>
+    private static double EffectiveSourceDuration(JsonObject clipRow) =>
+        EditorStore.ClipMaster(clipRow)?.Duration ?? ClipDuration(clipRow);
+
     private static double LongformDuration(JsonObject editRow) =>
         Dbl(editRow["duration_seconds"]) ?? 0;
 
@@ -179,26 +187,37 @@ public static class EditorEndpoints
         SupabaseDb db, Guid projectId, JsonObject row, CancellationToken ct)
     {
         var clip = ProjectShaper.Clip(row);
+        var master = EditorStore.ClipMaster(row);
         var doc = EditorStore.ClipDoc(row);
         if (doc is null)
         {
-            // Fresh document: whole clip on the timeline, captions seeded from
-            // the transcript words inside the clip's source window.
+            // Fresh document: the original cut on the timeline, captions seeded
+            // from transcript words over the whole media window (handle words
+            // included — they surface when the user extends into them). Times
+            // are re-based so t=0 is the media file's first frame.
             var chunks = await db.ListTranscriptChunksAsync(projectId, includeWords: true, ct);
             var captions = EditorDocs.SeedCaptions(
-                chunks.OfType<JsonObject>(), clip.StartSeconds, clip.EndSeconds);
-            doc = EditorDocs.Default(clip.DurationSeconds, captions);
+                chunks.OfType<JsonObject>(),
+                clip.StartSeconds - (master?.PadStart ?? 0),
+                clip.EndSeconds + (master?.PadEnd ?? 0));
+            doc = master is null
+                ? EditorDocs.Default(clip.DurationSeconds, captions)
+                : EditorDocs.Default(master.Duration, captions,
+                    cutStart: master.PadStart,
+                    cutEnd: master.PadStart + clip.DurationSeconds);
         }
         return new EditorDocResponse(
             doc,
             Target: "clip",
             ClipId: clip.Id,
             LongformVersion: null,
-            SourceUrl: clip.VerticalUrl ?? clip.VideoUrl ?? clip.CaptionedUrl,
+            SourceUrl: master?.Url ?? clip.VerticalUrl ?? clip.VideoUrl ?? clip.CaptionedUrl,
             PosterUrl: clip.ThumbnailUrl,
-            SourceDuration: clip.DurationSeconds,
+            SourceDuration: master?.Duration ?? clip.DurationSeconds,
             SavedAt: EditorStore.ClipSavedAt(row),
-            Export: EditorStore.ClipExport(row));
+            Export: EditorStore.ClipExport(row),
+            SourceFps: EditorStore.ClipFps(row),
+            Handles: master is null ? null : new EditorHandlesDto(master.PadStart, master.PadEnd));
     }
 
     private static EditorDocResponse LongformDocResponse(JsonObject row)

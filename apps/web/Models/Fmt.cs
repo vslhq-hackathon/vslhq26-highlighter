@@ -26,13 +26,15 @@ public static class Fmt
             : $"{t.Minutes:00}:{t.Seconds:00}";
     }
 
-    /// <summary>Editor timecode "00:00:12:04" (30 fps frame counter).</summary>
-    public static string Timecode(double seconds)
+    /// <summary>Editor timecode "00:00:12:04" — a frame counter at the media's
+    /// real rate (non-drop-frame, so 29.97 counts 0..29 like an NDF timecode).</summary>
+    public static string Timecode(double seconds, double fps = 30)
     {
         if (!double.IsFinite(seconds)) seconds = 0;
         var clamped = Math.Max(0, seconds);
         var t = TimeSpan.FromSeconds(clamped);
-        var frames = (int)Math.Round(t.Milliseconds / 1000.0 * 30) % 30;
+        var frameRate = double.IsFinite(fps) && fps >= 1 ? (int)Math.Round(fps) : 30;
+        var frames = (int)Math.Round(t.Milliseconds / 1000.0 * frameRate) % frameRate;
         return $"{(int)t.TotalHours:00}:{t.Minutes:00}:{t.Seconds:00}:{frames:00}";
     }
 

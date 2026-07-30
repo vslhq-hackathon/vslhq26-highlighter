@@ -768,71 +768,104 @@ public static class Revise
                 .Where(part => !string.IsNullOrEmpty(part)));
         var byIndex = state.Chunks.ToDictionary(
             chunk => JsonUtil.Int(chunk["chunk_index"]), chunk => chunk);
-        var results = new JsonArray();
-        foreach (var index in indexes)
+        // Each rescore is an independent audio-LLM round trip (pure API
+        // latency): run up to 4 together, emit results in request order.
+        var slots = new JsonObject[indexes.Count];
+        using var gate = new SemaphoreSlim(4);
+        var tasks = new List<Task>();
+        for (var position = 0; position < indexes.Count; position++)
         {
-            if (!byIndex.TryGetValue(index, out var chunk))
+            var slot = position;
+            var index = indexes[slot];
+            tasks.Add(Task.Run(() =>
             {
-                results.Add(new JsonObject
+                gate.Wait();
+                try
                 {
-                    ["chunk_index"] = index,
-                    ["error"] = "no such chunk",
-                });
-                continue;
-            }
-            var audioPath = ResolveMediaPath(
-                JsonUtil.StrOrNull((chunk["metadata"] as JsonObject)?["audio_path"]),
-                state.ProjectDir,
-                "audio");
-            var chunkStart = JsonUtil.Int(chunk["start_seconds"]);
-            var chunkEnd = JsonUtil.Int(chunk["end_seconds"]);
-            var audioContext = audioPath is not null
-                ? new List<JsonObject>
-                {
-                    new()
-                    {
-                        ["path"] = audioPath,
-                        ["start_seconds"] = JsonUtil.C(chunk["start_seconds"]),
-                        ["end_seconds"] = JsonUtil.C(chunk["end_seconds"]),
-                    },
+                    slots[slot] = RescoreChunk(index, byIndex, instructions, state);
                 }
-                : new List<JsonObject>();
-            var (candidates, assessment) = Llm.DetectClipCandidates(
-                transcript: JsonUtil.Str(chunk["transcript"]),
-                words: JsonUtil.Objects(chunk["words"]),
-                chunkIndex: index,
-                startSeconds: chunkStart,
-                endSeconds: chunkEnd,
-                pipelineMode: "long",
-                userInstructions: instructions.Length > 0 ? instructions : null,
-                targetLength: state.TargetLength,
-                researchContext: state.Research,
-                audioContext: audioContext,
-                sceneCuts: state.Cuts
-                    .Where(cut => chunkStart <= cut && cut <= chunkEnd)
-                    .ToList(),
-                sourceMinutes: state.SourceMinutes);
-            var candidateRows = new JsonArray();
-            foreach (var c in candidates)
-            {
-                candidateRows.Add(new JsonObject
+                catch (Exception exc)
                 {
-                    ["start_seconds"] = JsonUtil.C(c["start_seconds"]),
-                    ["end_seconds"] = JsonUtil.C(c["end_seconds"]),
-                    ["title"] = JsonUtil.C(c["title"]),
-                    ["description"] = JsonUtil.C(c["description"]),
-                    ["score"] = JsonUtil.C(c["score"]),
-                    ["reason"] = JsonUtil.C(c["reason"]),
-                });
-            }
-            results.Add(new JsonObject
+                    slots[slot] = new JsonObject
+                    {
+                        ["chunk_index"] = index,
+                        ["error"] = exc.Message,
+                    };
+                }
+                finally
+                {
+                    gate.Release();
+                }
+            }));
+        }
+        Task.WaitAll(tasks.ToArray());
+        var results = new JsonArray();
+        foreach (var row in slots) results.Add(row);
+        return JsonUtil.DumpsIndented(results);
+    }
+
+    private static JsonObject RescoreChunk(
+        int index, Dictionary<int, JsonObject> byIndex, string instructions, ReviseState state)
+    {
+        if (!byIndex.TryGetValue(index, out var chunk))
+        {
+            return new JsonObject
             {
                 ["chunk_index"] = index,
-                ["assessment"] = assessment,
-                ["candidates"] = candidateRows,
+                ["error"] = "no such chunk",
+            };
+        }
+        var audioPath = ResolveMediaPath(
+            JsonUtil.StrOrNull((chunk["metadata"] as JsonObject)?["audio_path"]),
+            state.ProjectDir,
+            "audio");
+        var chunkStart = JsonUtil.Int(chunk["start_seconds"]);
+        var chunkEnd = JsonUtil.Int(chunk["end_seconds"]);
+        var audioContext = audioPath is not null
+            ? new List<JsonObject>
+            {
+                new()
+                {
+                    ["path"] = audioPath,
+                    ["start_seconds"] = JsonUtil.C(chunk["start_seconds"]),
+                    ["end_seconds"] = JsonUtil.C(chunk["end_seconds"]),
+                },
+            }
+            : new List<JsonObject>();
+        var (candidates, assessment) = Llm.DetectClipCandidates(
+            transcript: JsonUtil.Str(chunk["transcript"]),
+            words: JsonUtil.Objects(chunk["words"]),
+            chunkIndex: index,
+            startSeconds: chunkStart,
+            endSeconds: chunkEnd,
+            pipelineMode: "long",
+            userInstructions: instructions.Length > 0 ? instructions : null,
+            targetLength: state.TargetLength,
+            researchContext: state.Research,
+            audioContext: audioContext,
+            sceneCuts: state.Cuts
+                .Where(cut => chunkStart <= cut && cut <= chunkEnd)
+                .ToList(),
+            sourceMinutes: state.SourceMinutes);
+        var candidateRows = new JsonArray();
+        foreach (var c in candidates)
+        {
+            candidateRows.Add(new JsonObject
+            {
+                ["start_seconds"] = JsonUtil.C(c["start_seconds"]),
+                ["end_seconds"] = JsonUtil.C(c["end_seconds"]),
+                ["title"] = JsonUtil.C(c["title"]),
+                ["description"] = JsonUtil.C(c["description"]),
+                ["score"] = JsonUtil.C(c["score"]),
+                ["reason"] = JsonUtil.C(c["reason"]),
             });
         }
-        return JsonUtil.DumpsIndented(results);
+        return new JsonObject
+        {
+            ["chunk_index"] = index,
+            ["assessment"] = assessment,
+            ["candidates"] = candidateRows,
+        };
     }
 
     public static (double Start, double End) Window(
@@ -1033,20 +1066,31 @@ public static class Revise
             try
             {
                 var storageKey = $"projects/{projectId}/longform/{Path.GetFileName(outputPath)}";
-                var videoUrl = db.UploadStorageObject(
-                    bucket: clipsBucket, key: storageKey, path: outputPath);
+                // Never throws: an oversized or failed upload serves from the
+                // local /media mirror, and the longform_edits row still lands.
+                var videoUrl = Uploads.UploadVideoOrLocalUrl(
+                    db, bucket: clipsBucket, key: storageKey, path: outputPath,
+                    label: "Revision video");
                 result["bucket"] = clipsBucket;
                 result["storage_path"] = storageKey;
                 result["video_url"] = videoUrl;
                 if (thumbnailPath is not null)
                 {
-                    var thumbnailKey =
-                        $"projects/{projectId}/longform/{Path.GetFileName(thumbnailPath)}";
-                    var midframeUrl = db.UploadStorageObject(
-                        bucket: clipsBucket, key: thumbnailKey, path: thumbnailPath);
-                    result["thumbnail_storage_path"] = thumbnailKey;
-                    if (!JsonUtil.Truthy(result["thumbnail_url"]))
-                        result["thumbnail_url"] = midframeUrl;
+                    try
+                    {
+                        var thumbnailKey =
+                            $"projects/{projectId}/longform/{Path.GetFileName(thumbnailPath)}";
+                        var midframeUrl = db.UploadStorageObject(
+                            bucket: clipsBucket, key: thumbnailKey, path: thumbnailPath);
+                        result["thumbnail_storage_path"] = thumbnailKey;
+                        if (!JsonUtil.Truthy(result["thumbnail_url"]))
+                            result["thumbnail_url"] = midframeUrl;
+                    }
+                    catch (Exception exc)
+                    {
+                        Console.WriteLine(
+                            $"Revision thumbnail upload failed (non-fatal): {exc.Message}");
+                    }
                 }
                 db.InsertLongformEdit(
                     projectId: projectId,

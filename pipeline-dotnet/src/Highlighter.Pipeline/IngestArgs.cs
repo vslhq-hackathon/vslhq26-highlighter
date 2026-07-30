@@ -30,6 +30,7 @@ public class IngestArgs
     public int LlmMarkerSeconds = Defaults.DEFAULT_LLM_MARKER_SECONDS;
     public int LlmConcurrency = Defaults.DEFAULT_LLM_CONCURRENCY;
     public int LlmContextSeconds = Defaults.DEFAULT_LLM_CONTEXT_SECONDS;
+    public int TranscribeConcurrency = Defaults.DEFAULT_TRANSCRIBE_CONCURRENCY;
 
     public static IngestArgs Parse(string[] argv)
     {
@@ -55,6 +56,8 @@ public class IngestArgs
             LlmConcurrency = Config.IntEnv("LLM_CONCURRENCY", Defaults.DEFAULT_LLM_CONCURRENCY),
             LlmContextSeconds = Config.IntEnv(
                 "LLM_CONTEXT_SECONDS", Defaults.DEFAULT_LLM_CONTEXT_SECONDS),
+            TranscribeConcurrency = Config.IntEnv(
+                "TRANSCRIBE_CONCURRENCY", Defaults.DEFAULT_TRANSCRIBE_CONCURRENCY),
         };
 
         var positionals = new List<string>();
@@ -136,6 +139,9 @@ public class IngestArgs
                     break;
                 case "--llm-context-seconds":
                     args.LlmContextSeconds = Argv.Int(Next(), "--llm-context-seconds");
+                    break;
+                case "--transcribe-concurrency":
+                    args.TranscribeConcurrency = Argv.Int(Next(), "--transcribe-concurrency");
                     break;
                 default:
                     Argv.Positional(flag, positionals);

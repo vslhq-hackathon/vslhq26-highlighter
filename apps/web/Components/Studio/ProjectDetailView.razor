@@ -156,6 +156,11 @@
                                 {
                                     <img src="@thumb" alt="@clip.Title" loading="lazy" class="absolute inset-0 h-full w-full object-cover" />
                                 }
+                                else if ((clip.VerticalUrl ?? clip.CaptionedUrl ?? clip.VideoUrl) is { } media)
+                                {
+                                    @* No thumbnail upload — let the browser paint a real frame. *@
+                                    <video src="@($"{media}#t=0.5")" preload="metadata" muted playsinline class="absolute inset-0 h-full w-full object-cover"></video>
+                                }
                                 else
                                 {
                                     <span class="font-mono text-[10px] text-dim">@(clip.Status == "rendered" ? "highlight frame" : "rendering…")</span>

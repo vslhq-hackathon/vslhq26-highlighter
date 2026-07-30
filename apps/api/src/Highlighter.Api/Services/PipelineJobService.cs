@@ -42,7 +42,7 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
     /// <summary>id may be preassigned (POST /api/projects writes it into the row's
     /// instance_id before the row exists, so it must be known up front).</summary>
     public PipelineJob Start(string kind, Guid? projectId, IReadOnlyList<string> workerArgs,
-        string? id = null, Guid? ownerId = null)
+        string? id = null, Guid? ownerId = null, AgentChatRef? agentChat = null)
     {
         var command = layout.ResolveWorkerCommand()
             ?? throw new WorkerUnavailableException(
@@ -56,7 +56,10 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
         var logName = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{kind}"
             + $"-{(projectId is { } p ? p.ToString()[..8] : "global")}-{id}.log";
         var job = new PipelineJob(id, kind, projectId, display,
-            Path.Combine(layout.JobLogRoot, logName), ownerId);
+            Path.Combine(layout.JobLogRoot, logName), ownerId)
+        {
+            AgentChat = agentChat,
+        };
 
         lock (_gate)
         {
@@ -399,6 +402,69 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
             process.Dispose();
             Evict();
         }
+        await WriteAgentChatCompletionAsync(job);
+    }
+
+    /// <summary>The durable "I'm back" message for a chat-started job: appended
+    /// to agent_messages when the job ends, whether or not any browser is open.
+    /// Never throws — a chat write must not affect job supervision.</summary>
+    private async Task WriteAgentChatCompletionAsync(PipelineJob job)
+    {
+        if (job.AgentChat is not { } chat) return;
+        try
+        {
+            string text;
+            if (job.State == JobState.Succeeded)
+            {
+                var latest = await db.GetLongformEditAsync(chat.ProjectId);
+                text = latest is not null
+                    ? RevisionCompletionText(latest)
+                    : $"The revision finished (job {job.Id}), but I can't see the new version yet — "
+                      + "refresh the project to check.";
+            }
+            else
+            {
+                var reason = job.FailureReason ?? "it stopped without a status";
+                var tail = string.Join(" · ", job.Tail(2)
+                    .Select(line => line.Line.Trim())
+                    .Where(line => line.Length > 0));
+                text = $"The revision didn't finish — {reason}."
+                    + (tail.Length > 0 ? $" Last log lines: {tail}" : "");
+            }
+
+            await db.InsertAgentMessageAsync(new JsonObject
+            {
+                ["project_id"] = chat.ProjectId.ToString(),
+                ["context"] = chat.Context,
+                ["role"] = "agent",
+                ["text"] = text,
+                ["job_id"] = job.Id,
+                ["job_final"] = true,
+            });
+            log.LogInformation("Job {JobId}: agent chat completion recorded", job.Id);
+        }
+        catch (Exception exception)
+        {
+            log.LogError(exception, "Job {JobId}: agent chat completion write failed", job.Id);
+        }
+    }
+
+    /// <summary>The success message for a finished revision, from the newest
+    /// longform_edits row — revision.notes is already the revise agent's own
+    /// summary of what it changed, so no extra model call is needed.</summary>
+    public static string RevisionCompletionText(JsonObject editRow)
+    {
+        var version = (int)(editRow["version"]?.GetValue<double>() ?? 0);
+        var duration = editRow["duration_seconds"]?.GetValue<double>();
+        var notes = (editRow["revision"] as JsonObject)?["notes"]?.GetValue<string>()?.Trim();
+        if (notes is { Length: > 600 }) notes = notes[..600].TrimEnd() + "…";
+
+        var length = duration is { } seconds
+            ? $" ({TimeSpan.FromSeconds(seconds):m\\:ss})"
+            : "";
+        var text = $"Done — the revision rendered as v{version}{length}.";
+        if (!string.IsNullOrEmpty(notes)) text += $" {notes}";
+        return text + " Take a look and tell me what to adjust next.";
     }
 
     private async Task<string?> ReconcileIngestRowAsync(PipelineJob job, Guid projectId, int exitCode)

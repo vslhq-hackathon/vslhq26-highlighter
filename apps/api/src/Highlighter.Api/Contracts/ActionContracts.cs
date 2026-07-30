@@ -1,6 +1,8 @@
 namespace Highlighter.Api.Contracts;
 
-public record ReviseRequestDto(string? Request);
+/// <summary>FromChat marks a revision started by the studio agent: the job then
+/// writes its completion message into agent_messages when it ends.</summary>
+public record ReviseRequestDto(string? Request, bool FromChat = false);
 
 /// <summary>Target "longform" publishes the stitched edit (Version picks one);
 /// target "clip" requires ClipId, resolved server-side to the worker's filename

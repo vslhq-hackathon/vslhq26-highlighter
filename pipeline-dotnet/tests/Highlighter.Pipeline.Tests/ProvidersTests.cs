@@ -65,13 +65,13 @@ public sealed class ProvidersTests : IDisposable
     }
 
     [Fact]
-    public void AzureEditorRunsFirstAtMaxReasoning()
+    public void EditorChainRunsOpenRouterFirstWithAzureAtMaxReasoning()
     {
         Environment.SetEnvironmentVariable("OPENROUTER_API_KEY", "or-key");
         SetAzure("AZURE_EDITOR", "gpt-5.4");
         var providers = Providers.EditorProviders(title: "t");
-        Assert.Equal(new[] { "azure", "openrouter" }, providers.Select(p => p.Name));
-        var azure = providers[0];
+        Assert.Equal(new[] { "openrouter", "azure" }, providers.Select(p => p.Name));
+        var azure = providers[1];
         Assert.Equal("gpt-5.4", azure.Model);
         Assert.Equal("https://example.openai.azure.com/openai/v1", azure.BaseUrl);
         Assert.Equal("xhigh", JsonUtil.Str(azure.ExtraBody["reasoning_effort"]));

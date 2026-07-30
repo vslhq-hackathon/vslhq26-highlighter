@@ -213,6 +213,22 @@ public sealed class SupabaseDb
             $"project_id=eq.{projectId}&select={columns}&order=chunk_index.asc", ct);
     }
 
+    // ---- agent chat ----
+
+    public Task<JsonArray> ListAgentMessagesAsync(
+        Guid projectId, string context, int limit = 200, CancellationToken ct = default) =>
+        GetArrayAsync("agent_messages",
+            $"project_id=eq.{projectId}&context=eq.{Uri.EscapeDataString(context)}"
+            + $"&select=*&order=created_at.asc&limit={limit}", ct);
+
+    public async Task<JsonObject> InsertAgentMessageAsync(JsonObject row, CancellationToken ct = default)
+    {
+        var body = await SendAsync(HttpMethod.Post, "agent_messages", "select=*", row,
+            "return=representation", ct);
+        return FirstOrNull(AsArray(body, "POST agent_messages"))
+            ?? throw new PostgrestException("POST agent_messages", null, "insert returned no row");
+    }
+
     // ---- media cleanup outbox ----
 
     public async Task<int> CountCleanupJobsAsync(string status, CancellationToken ct = default)

@@ -8,12 +8,45 @@ namespace Highlighter.Api.Services;
 /// longform_edits.metadata.editor_draft (the `editor` COLUMN belongs to the
 /// pipeline's pass-2 notes). All writes are read-modify-write of the whole
 /// metadata object so worker-owned keys survive.</summary>
+/// <summary>The padded editing master the pipeline renders next to a clip's
+/// deliverable (clip window ±handle seconds). Null → legacy clip: the editor
+/// works on the bare render and extension is unavailable.</summary>
+public sealed record MasterInfo(
+    string Url, double Duration, double PadStart, double PadEnd, string? LocalPath);
+
 public sealed class EditorStore(SupabaseDb db)
 {
     // ---- clip documents --------------------------------------------------- //
 
-    public static EditorDoc? ClipDoc(JsonObject clipRow) =>
-        EditorDocs.FromJson(((clipRow["metadata"] as JsonObject)?["editor"] as JsonObject)?["edl"]);
+    public static MasterInfo? ClipMaster(JsonObject clipRow)
+    {
+        var render = (clipRow["metadata"] as JsonObject)?["render"] as JsonObject;
+        var url = render?["master_url"]?.GetValue<string>();
+        var duration = Dbl(render?["master_duration_seconds"]);
+        if (string.IsNullOrEmpty(url) || duration is not > 0) return null;
+        return new MasterInfo(
+            url,
+            duration.Value,
+            Dbl(render?["master_pad_start"]) ?? 0,
+            Dbl(render?["master_pad_end"]) ?? 0,
+            render?["master_local_path"]?.GetValue<string>());
+    }
+
+    public static double? ClipFps(JsonObject clipRow) =>
+        Dbl(((clipRow["metadata"] as JsonObject)?["render"] as JsonObject)?["fps"]);
+
+    /// <summary>The saved document, re-based onto the padded master when one
+    /// exists but the doc predates it (editor.base != "master").</summary>
+    public static EditorDoc? ClipDoc(JsonObject clipRow)
+    {
+        var editor = (clipRow["metadata"] as JsonObject)?["editor"] as JsonObject;
+        var doc = EditorDocs.FromJson(editor?["edl"]);
+        if (doc is null) return null;
+        if (ClipMaster(clipRow) is { PadStart: > 0 } master
+            && editor?["base"]?.GetValue<string>() != "master")
+            return EditorDocs.ShiftDoc(doc, master.PadStart);
+        return doc;
+    }
 
     public static DateTimeOffset? ClipSavedAt(JsonObject clipRow) =>
         ParseTime(((clipRow["metadata"] as JsonObject)?["editor"] as JsonObject)?["saved_at"]);
@@ -39,6 +72,8 @@ public sealed class EditorStore(SupabaseDb db)
         var editor = metadata["editor"] as JsonObject ?? new JsonObject();
         editor["edl"] = EditorDocs.ToJson(doc);
         editor["saved_at"] = DateTimeOffset.UtcNow.ToString("o");
+        // Which timebase the doc's source seconds live in — masters shift t=0.
+        editor["base"] = ClipMaster(row) is not null ? "master" : "clip";
         metadata["editor"] = editor;
         return await db.PatchClipAsync(clipId, projectId, new JsonObject { ["metadata"] = metadata }, ct);
     }
