@@ -29,7 +29,9 @@ public static class Defaults
     public const string DEFAULT_TARGET_LENGTH_MINUTES = "7-15";
     public const string DEFAULT_RESEARCH_MODEL = "anthropic/claude-sonnet-5";
     public const string DEFAULT_THUMBNAIL_MODEL = "google/gemini-3.1-flash-image";
-    public const string DEFAULT_CAPTION_TEMPLATE = "instagram";
+    // Must be a template this machine's pycaps actually ships ("instagram" is
+    // not one of them; pycaps aborts the captioned render if it's missing).
+    public const string DEFAULT_CAPTION_TEMPLATE = "hype";
     // Azure AI integration: Azure Speech transcription runs first with Deepgram
     // as the fallback, and the Azure OpenAI deployments sit in every model chain
     // (see Providers.cs for the per-role order). Reasoning-capable deployments

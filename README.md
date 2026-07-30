@@ -49,7 +49,7 @@ create an account, and paste a video URL.
 
 ## Demo
 
-`./demo/demo.mp4`
+`./demo/demo.mov`
 
 ## Known limits
 

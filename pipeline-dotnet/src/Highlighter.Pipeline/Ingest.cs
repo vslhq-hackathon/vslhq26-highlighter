@@ -1634,8 +1634,8 @@ public static class Ingest
             try
             {
                 var storageKey = $"projects/{projectId}/longform/{Path.GetFileName(outputPath)}";
-                var videoUrl = db.UploadStorageObject(
-                    bucket: clipsBucket, key: storageKey, path: outputPath);
+                var videoUrl = UploadVideoOrLocalUrl(
+                    db, bucket: clipsBucket, key: storageKey, path: outputPath, label: "Long-form video");
                 result["bucket"] = clipsBucket;
                 result["storage_path"] = storageKey;
                 result["video_url"] = videoUrl;
@@ -1717,6 +1717,46 @@ public static class Ingest
         });
         Console.WriteLine($"Long-form video ready: {outputPath}");
         return result;
+    }
+
+    // Supabase storage rejects objects over the project's global size cap
+    // (~50 MB here) with a 413; renders bigger than this go to the API's
+    // local /media mirror instead of a doomed upload.
+    private const long MAX_STORAGE_UPLOAD_BYTES = 48L * 1024 * 1024;
+
+    /// <summary>URL for a render served from the API's /media mirror of
+    /// outputs/ (HIGHLIGHTER_MEDIA_BASE overrides the local default).</summary>
+    private static string LocalMediaUrl(string path)
+    {
+        var relative = Path
+            .GetRelativePath(Directory.GetCurrentDirectory(), Path.GetFullPath(path))
+            .Replace(Path.DirectorySeparatorChar, '/');
+        if (relative.StartsWith("outputs/")) relative = relative["outputs/".Length..];
+        var mediaBase = Environment.GetEnvironmentVariable("HIGHLIGHTER_MEDIA_BASE");
+        if (string.IsNullOrWhiteSpace(mediaBase)) mediaBase = "http://localhost:5199/media";
+        return $"{mediaBase.TrimEnd('/')}/{relative}";
+    }
+
+    /// <summary>Upload a rendered video, falling back to its local /media URL
+    /// when it exceeds the storage size cap or the upload fails. Never throws —
+    /// a failed upload must not cost the row that references the render.</summary>
+    private static string UploadVideoOrLocalUrl(
+        SupabaseClient db, string bucket, string key, string path, string label)
+    {
+        if (new FileInfo(path).Length > MAX_STORAGE_UPLOAD_BYTES)
+        {
+            Console.WriteLine($"{label} exceeds the storage size cap; serving via local /media.");
+            return LocalMediaUrl(path);
+        }
+        try
+        {
+            return db.UploadStorageObject(bucket: bucket, key: key, path: path);
+        }
+        catch (Exception exc)
+        {
+            Console.WriteLine($"{label} upload failed; serving via local /media: {exc.Message}");
+            return LocalMediaUrl(path);
+        }
     }
 
     /// <summary>The thumbnail a longform_edits row shows: the selected generated
@@ -1992,10 +2032,8 @@ public static class Ingest
             if (db is not null)
             {
                 var storageKey = $"projects/{projectId}/clips/{filename}";
-                var videoUrl = db.UploadStorageObject(
-                    bucket: clipsBucket,
-                    key: storageKey,
-                    path: outputPath);
+                var videoUrl = UploadVideoOrLocalUrl(
+                    db, bucket: clipsBucket, key: storageKey, path: outputPath, label: "Clip");
                 renderResult["bucket"] = clipsBucket;
                 renderResult["storage_path"] = storageKey;
                 renderResult["video_url"] = videoUrl;
@@ -2016,33 +2054,21 @@ public static class Ingest
                 }
                 if (verticalPath is not null)
                 {
-                    try
-                    {
-                        var verticalKey =
-                            $"projects/{projectId}/clips/{Path.GetFileName(verticalPath)}";
-                        renderResult["vertical_url"] = db.UploadStorageObject(
-                            bucket: clipsBucket, key: verticalKey, path: verticalPath);
-                        renderResult["vertical_storage_path"] = verticalKey;
-                    }
-                    catch (Exception exc)
-                    {
-                        Console.WriteLine($"Vertical clip upload failed (non-fatal): {exc.Message}");
-                    }
+                    var verticalKey =
+                        $"projects/{projectId}/clips/{Path.GetFileName(verticalPath)}";
+                    renderResult["vertical_url"] = UploadVideoOrLocalUrl(
+                        db, bucket: clipsBucket, key: verticalKey, path: verticalPath,
+                        label: "Vertical clip");
+                    renderResult["vertical_storage_path"] = verticalKey;
                 }
                 if (captionedPath is not null)
                 {
-                    try
-                    {
-                        var captionedKey =
-                            $"projects/{projectId}/clips/{Path.GetFileName(captionedPath)}";
-                        renderResult["captioned_url"] = db.UploadStorageObject(
-                            bucket: clipsBucket, key: captionedKey, path: captionedPath);
-                        renderResult["captioned_storage_path"] = captionedKey;
-                    }
-                    catch (Exception exc)
-                    {
-                        Console.WriteLine($"Captioned clip upload failed (non-fatal): {exc.Message}");
-                    }
+                    var captionedKey =
+                        $"projects/{projectId}/clips/{Path.GetFileName(captionedPath)}";
+                    renderResult["captioned_url"] = UploadVideoOrLocalUrl(
+                        db, bucket: clipsBucket, key: captionedKey, path: captionedPath,
+                        label: "Captioned clip");
+                    renderResult["captioned_storage_path"] = captionedKey;
                 }
             }
 
