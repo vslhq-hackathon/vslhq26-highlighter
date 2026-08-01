@@ -1,4 +1,5 @@
 using Highlighter.Web.Components;
+using Microsoft.AspNetCore.DataProtection;
 using Highlighter.Web.Models;
 using Highlighter.Web.Services;
 
@@ -18,6 +19,18 @@ var builder = WebApplication.CreateBuilder(args);
 // Add services to the container.
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
+
+// Auth tokens sit in DataProtection-encrypted browser storage. In a container
+// the default key ring is ephemeral — every restart would invalidate every
+// session — so when a key directory is configured (a mounted volume in Azure),
+// persist the keys there.
+var dataProtectionKeysDir = builder.Configuration["DataProtection:KeysDir"];
+if (!string.IsNullOrWhiteSpace(dataProtectionKeysDir))
+{
+    Directory.CreateDirectory(dataProtectionKeysDir);
+    builder.Services.AddDataProtection()
+        .PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeysDir));
+}
 
 // The Highlighter API (apps/api). Server-to-server: the browser only ever talks
 // to this Blazor app; auth tokens live in DataProtection-encrypted local

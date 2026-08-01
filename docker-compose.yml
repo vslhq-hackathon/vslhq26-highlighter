@@ -1,0 +1,34 @@
+# Local container parity with the Azure deployment:
+#   cp .env.example .env   (fill in keys)
+#   docker compose up --build
+# Web: http://localhost:5097 — API: http://localhost:5199
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+      # args: { INSTALL_SHOTS: "true" }   # opt into TransNetV2 scene cuts (multi-GB)
+    env_file: .env
+    environment:
+      Api__CorsOrigins__0: http://localhost:5097
+    ports:
+      - "5199:8080"
+    volumes:
+      - outputs:/app/outputs
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    env_file: .env
+    environment:
+      Api__BaseUrl: http://api:8080
+      DataProtection__KeysDir: /keys
+    ports:
+      - "5097:8080"
+    volumes:
+      - dpkeys:/keys
+    depends_on:
+      - api
+volumes:
+  outputs:
+  dpkeys:

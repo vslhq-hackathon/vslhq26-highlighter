@@ -1,0 +1,94 @@
+# CD: on every push to main (after CI passes on the merge), build the two
+# images, push them to Azure Container Registry, and roll the Container Apps to
+# the new revision. Authentication is OIDC — GitHub mints a short-lived token
+# that Azure trusts via a federated credential; no long-lived secret is stored.
+#
+# Required repository configuration (Settings → Secrets and variables → Actions):
+#   secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   variables: AZURE_RESOURCE_GROUP, ACR_NAME
+# One-time Azure setup is described in docs/DEPLOYMENT.md.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Deploys are serialized; a newer push supersedes a queued one.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # OIDC token for azure/login
+  contents: read
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      matrix:
+        image: [api, web]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to ACR
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/${{ matrix.image }}.Dockerfile
+          push: true
+          tags: |
+            ${{ vars.ACR_NAME }}.azurecr.io/highlighter-${{ matrix.image }}:${{ github.sha }}
+            ${{ vars.ACR_NAME }}.azurecr.io/highlighter-${{ matrix.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+
+  deploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Pointing the app at the new sha-tagged image creates a new revision;
+      # single-revision mode drains the old one once the new one is healthy.
+      - name: Roll Container Apps to ${{ github.sha }}
+        run: |
+          az containerapp update \
+            --name highlighter-api \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image ${{ vars.ACR_NAME }}.azurecr.io/highlighter-api:${{ github.sha }}
+          az containerapp update \
+            --name highlighter-web \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image ${{ vars.ACR_NAME }}.azurecr.io/highlighter-web:${{ github.sha }}
+
+      - name: Smoke check
+        run: |
+          API_FQDN=$(az containerapp show --name highlighter-api \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          for i in $(seq 1 12); do
+            if curl -fsS "https://$API_FQDN/healthz" > /dev/null; then
+              echo "API healthy"; exit 0
+            fi
+            sleep 10
+          done
+          echo "API never became healthy" >&2; exit 1
