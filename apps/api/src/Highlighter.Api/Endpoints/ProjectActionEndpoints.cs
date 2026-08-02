@@ -212,23 +212,51 @@ public static class ProjectActionEndpoints
 
         group.MapPost("/{id:guid}/thumbnails/select",
             async (Guid id, ThumbnailSelectRequestDto body, ClaimsPrincipal user, SupabaseDb db,
-                PipelineJobService jobs, RepoLayout layout, CancellationToken ct) =>
+                RepoLayout layout, CancellationToken ct) =>
             {
                 if (body.Index < 1)
                     return Problem(400, "Invalid request", "index must be >= 1");
                 if (await db.GetProjectAsync(id, "id", AuthHelpers.Uid(user), ct) is null) return NotFound(id);
-                if (!layout.HasLocalMirror(id)) return NoMirror(id, "thumbnails");
 
-                // Selection is a metadata flip, not a render — run it and wait
-                // briefly so callers (the studio agent) get a definite answer.
-                var job = jobs.Start("thumbnails", id,
-                    WorkerArgs.Thumbnails(id, prompt: null, body.Version, select: body.Index),
-                    ownerId: AuthHelpers.Uid(user));
-                var finished = await PipelineJobService.WaitForExitAsync(
-                    job, TimeSpan.FromSeconds(20), ct);
-                return finished
-                    ? Results.Ok(job.ToDto())
-                    : Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
+                // Selection is a metadata flip. It used to spawn a worker, which
+                // meant it only worked on the machine that ran the ingest.
+                var row = await db.GetLongformEditAsync(id, body.Version, ct);
+                if (row is null)
+                    return Problem(409, "Nothing to select",
+                        "No long-form edit exists for this project");
+                var editId = Guid.Parse(row["id"]!.GetValue<string>());
+                var version = (int)(row["version"]?.GetValue<double>() ?? 1);
+
+                var metadata = row["metadata"] as JsonObject ?? new JsonObject();
+                var render = metadata["render"] as JsonObject ?? new JsonObject();
+                var thumbnails = render["thumbnails"] as JsonObject;
+                var chosen = (thumbnails?["variants"] as JsonArray ?? []).OfType<JsonObject>()
+                    .FirstOrDefault(variant =>
+                        (int)(variant["index"]?.GetValue<double>() ?? 0) == body.Index
+                        && variant["url"]?.GetValue<string>() is { Length: > 0 });
+                if (chosen is null || thumbnails is null)
+                    return Problem(409, "No such thumbnail",
+                        $"No hosted thumbnail #{body.Index} on this cut");
+                var url = chosen["url"]!.GetValue<string>();
+
+                thumbnails["selected_index"] = body.Index;
+                render["thumbnails"] = thumbnails;
+                metadata["render"] = render;
+
+                var patched = await db.PatchLongformEditAsync(editId, new JsonObject
+                {
+                    ["metadata"] = metadata.DeepClone(),
+                    ["thumbnail_url"] = url,
+                }, ct);
+                // Keep the worker's mirror in step when this machine has one.
+                MirrorStore.UpdateLongformRow(layout.ProjectDir(id), version, mirrorRow =>
+                {
+                    var m = mirrorRow["metadata"] as JsonObject ?? new JsonObject();
+                    m["render"] = render.DeepClone();
+                    mirrorRow["metadata"] = m;
+                    mirrorRow["thumbnail_url"] = url;
+                });
+                return Results.Ok(ProjectShaper.Longform(patched ?? row));
             })
             .WithName("SelectThumbnail");
 
@@ -288,7 +316,7 @@ public static class ProjectActionEndpoints
                     ["storage_path"] = storagePath,
                 });
                 thumbnails["variants"] = variants;
-                thumbnails["selected_index"] = variants.Count - 1;
+                thumbnails["selected_index"] = nextIndex; // stable number, not a position
                 render["thumbnails"] = thumbnails;
                 metadata["render"] = render;
 

@@ -64,7 +64,10 @@ public record LongformEditDto(
     IReadOnlyList<ThumbnailVariantDto>? Thumbnails = null,
     int? SelectedThumbnail = null);
 
-public record ThumbnailVariantDto(int Index, string? Direction, string? OverlayText, string? Url);
+/// <summary>Error is set (and Url null) when the image model failed for this
+/// concept — the slot is kept so the picker can show and retry it.</summary>
+public record ThumbnailVariantDto(
+    int Index, string? Direction, string? OverlayText, string? Url, string? Error = null);
 
 public record LongformSegmentDto(
     int? ChunkIndex, string? Title, double StartSeconds, double EndSeconds);
@@ -160,6 +163,10 @@ public record EdlTransform(double Scale = 1.0, double PosX = 0.0);
 
 public record EdlAudio(double Voice = 1.0, double Music = 0.0);
 
+/// <param name="Format">Delivery aspect: "vertical" (1080×1920), "square"
+/// (1080×1080), "wide" (1920×1080), or "source" — the media's own geometry.</param>
+/// <param name="CaptionsEnabled">Burn captions on export and show them in the
+/// preview. Absent means enabled.</param>
 public record EditorDoc(
     int V,
     IReadOnlyList<EdlSegment> Segments,
@@ -169,7 +176,9 @@ public record EditorDoc(
     IReadOnlyList<EdlMarker> Markers,
     EdlTransform Transform,
     EdlAudio Audio,
-    string Reframe);
+    string Reframe,
+    string? Format = null,
+    bool? CaptionsEnabled = null);
 
 public record EditorExportInfoDto(
     string? Url, string? ThumbnailUrl, double? DurationSeconds, DateTimeOffset? ExportedAt);

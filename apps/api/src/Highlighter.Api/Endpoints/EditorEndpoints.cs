@@ -92,7 +92,7 @@ public static class EditorEndpoints
                 if (row is null)
                     return Problem(404, "No long-form edit",
                         "This project has no long-form cut to edit");
-                return Results.Ok(LongformDocResponse(row));
+                return Results.Ok(await LongformDocResponseAsync(db, id, row, ct));
             })
             .WithName("GetLongformEditorDoc");
 
@@ -112,7 +112,7 @@ public static class EditorEndpoints
                     return Problem(400, "Invalid document", invalid);
 
                 var saved = await new EditorStore(db).SaveLongformDraftAsync(row, doc, ct);
-                return Results.Ok(LongformDocResponse(saved ?? row));
+                return Results.Ok(await LongformDocResponseAsync(db, id, saved ?? row, ct));
             })
             .WithName("SaveLongformEditorDoc");
 
@@ -200,11 +200,15 @@ public static class EditorEndpoints
                 chunks.OfType<JsonObject>(),
                 clip.StartSeconds - (master?.PadStart ?? 0),
                 clip.EndSeconds + (master?.PadEnd ?? 0));
+            // Highlights are short-form deliverables: 9:16 by default, which is
+            // also what the editor's format chip has always claimed. Documents
+            // saved before formats existed stay on "source".
             doc = master is null
-                ? EditorDocs.Default(clip.DurationSeconds, captions)
+                ? EditorDocs.Default(clip.DurationSeconds, captions, format: "vertical")
                 : EditorDocs.Default(master.Duration, captions,
                     cutStart: master.PadStart,
-                    cutEnd: master.PadStart + clip.DurationSeconds);
+                    cutEnd: master.PadStart + clip.DurationSeconds,
+                    format: "vertical");
         }
         return new EditorDocResponse(
             doc,
@@ -220,11 +224,22 @@ public static class EditorEndpoints
             Handles: master is null ? null : new EditorHandlesDto(master.PadStart, master.PadEnd));
     }
 
-    private static EditorDocResponse LongformDocResponse(JsonObject row)
+    private static async Task<EditorDocResponse> LongformDocResponseAsync(
+        SupabaseDb db, Guid projectId, JsonObject row, CancellationToken ct)
     {
         var edit = ProjectShaper.Longform(row);
-        var doc = EditorStore.LongformDraft(row)
-            ?? EditorDocs.Default(edit.DurationSeconds ?? 0, []);
+        var doc = EditorStore.LongformDraft(row);
+        // Long-form documents used to open with no captions at all. Seed a
+        // fresh one — and also a saved draft that has none, since that only
+        // happens on drafts written before seeding existed. (Clearing every
+        // line deliberately is what the captions toggle is for.)
+        if (doc is null || doc.Captions.Count == 0)
+        {
+            var captions = await SeedLongformCaptionsAsync(db, projectId, edit, ct);
+            doc = doc is null
+                ? EditorDocs.Default(edit.DurationSeconds ?? 0, captions)
+                : doc with { Captions = captions };
+        }
         return new EditorDocResponse(
             doc,
             Target: "longform",
@@ -235,5 +250,28 @@ public static class EditorEndpoints
             SourceDuration: edit.DurationSeconds ?? 0,
             SavedAt: EditorStore.LongformSavedAt(row),
             Export: null);
+    }
+
+    /// <summary>Caption lines for a stitched cut. The segments carry SOURCE
+    /// windows but the cut plays them back to back, so each window's lines are
+    /// shifted by the running total of the durations before it.</summary>
+    private static async Task<List<EdlCaption>> SeedLongformCaptionsAsync(
+        SupabaseDb db, Guid projectId, LongformEditDto edit, CancellationToken ct)
+    {
+        var captions = new List<EdlCaption>();
+        if (edit.Segments.Count == 0) return captions;
+        var chunks = (await db.ListTranscriptChunksAsync(projectId, includeWords: true, ct))
+            .OfType<JsonObject>().ToList();
+        double elapsed = 0;
+        foreach (var segment in edit.Segments)
+        {
+            var span = segment.EndSeconds - segment.StartSeconds;
+            if (span <= 0) continue;
+            captions.AddRange(EditorDocs.OffsetCaptions(
+                EditorDocs.SeedCaptions(chunks, segment.StartSeconds, segment.EndSeconds),
+                elapsed, captions.Count + 1));
+            elapsed += span;
+        }
+        return captions;
     }
 }

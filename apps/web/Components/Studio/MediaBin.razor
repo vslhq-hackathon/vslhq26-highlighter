@@ -53,13 +53,8 @@
                 }
             }
         </div>
-        <div class="anim-fade-up flex items-center gap-1.5 border-t border-line px-3 py-2.5">
-            <span class="font-mono text-[9.5px] tracking-[0.08em] text-faint">STYLE</span>
-            @foreach (var k in new[] { "boxed", "plain", "karaoke" })
-            {
-                <span @onclick="() => PickStyle(k)" class="cursor-pointer rounded border px-[9px] py-[3px] text-[11px] hover:text-fg @(CurrentStyle == k ? "border-accent text-accent" : "border-line2 text-muted")">@(char.ToUpper(k[0]) + k[1..])</span>
-            }
-        </div>
+        @* Caption styling lives in the inspector with the rest of the
+           document-level settings; this tab edits the lines themselves. *@
     }
 </div>
 
@@ -67,7 +62,6 @@
     public record MediaItem(string Section, string Name, string Meta, string? Url, string? Thumb);
 
     private string? ActiveUrl => S.Edit.PreviewOverrideUrl ?? S.Edit.Meta?.SourceUrl ?? S.ActiveMediaUrl;
-    private string CurrentStyle => S.Edit.Doc?.CaptionStyle ?? S.CapStyle;
 
     private List<MediaItem> MediaItems
     {
@@ -103,10 +97,4 @@
     }
 
     private void Seek(EdlCaption caption) => S.Edit.RequestSeek(caption.Start);
-
-    private void PickStyle(string style)
-    {
-        S.SetCapStyle(style);            // preview fallback outside the editor
-        if (S.Edit.Doc is not null) S.Edit.SetCaptionStyle(style);
-    }
 }

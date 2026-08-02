@@ -8,9 +8,9 @@ public record AgentChatMessage(
 
 /// <summary>
 /// UI state for the studio — the same state machine the static design used
-/// (view, editorOpen, mode, binTab, panel, tool, activeCaption, capStyle,
-/// modalOpen, playing, sortOpen, sortBy, snap) plus the thumbnail picker,
-/// per-clip delivery options, and the agent chat — now backed by live API data:
+/// (view, editorOpen, mode, binTab, panel, tool, capStyle, modalOpen, playing,
+/// sortOpen, sortBy, snap) plus the thumbnail picker
+/// and the agent chat — now backed by live API data:
 /// Guid-keyed projects/clips, async loads, and a processing poll loop.
 /// Mutations go through Set(...) which raises Changed; components subscribe via
 /// StudioComponent.
@@ -37,7 +37,6 @@ public class StudioState : IDisposable
     public string BinTab { get; private set; } = "media";
     public string Panel { get; private set; } = "inspector";
     public string Tool { get; private set; } = "select";
-    public int ActiveCaption { get; private set; } = 1;
     public string CapStyle { get; private set; } = "boxed";
     public bool ModalOpen { get; private set; }
     public bool Playing { get; private set; }
@@ -76,9 +75,13 @@ public class StudioState : IDisposable
     public LongformEditDto? LatestLongform => Detail?.LongformEdits
         .FirstOrDefault(edit => edit.Status == "rendered" && edit.VideoUrl is not null);
 
-    public string LongformTitle =>
-        LatestLongform?.Title ?? (ProjectTitle.Length > 0 ? ProjectTitle : "Final cut");
-    public string ActiveClipTitle => ActiveClip?.Title ?? LongformTitle;
+    // Titles pass through Fmt.Title here, not at each render site: the model
+    // writes "…" into the titles it generates, and these feed the agent's
+    // greeting, the publish form's default title, and the editor chrome.
+    public string LongformTitle => Fmt.Title(
+        LatestLongform?.Title ?? (ProjectTitle.Length > 0 ? ProjectTitle : "Final cut"));
+    public string ActiveClipTitle =>
+        ActiveClip is { } clip ? Fmt.Title(clip.Title) : LongformTitle;
 
     public IEnumerable<ClipDto> SortedClips => SortBy == "score"
         ? (Detail?.Clips ?? []).OrderByDescending(clip => clip.Score ?? 0)
@@ -88,12 +91,32 @@ public class StudioState : IDisposable
         (Projects ?? []).Where(p => Search.Trim().Length == 0
             || p.Name.Contains(Search.Trim(), StringComparison.OrdinalIgnoreCase));
 
+    public bool SearchActive => Search.Trim().Length > 0;
+
+    /// <summary>The highlights the project page shows: inside a project the
+    /// search box filters this grid the way it filters the projects grid.</summary>
+    public IEnumerable<ClipDto> VisibleClips => SortedClips.Where(MatchesSearch);
+
+    private bool MatchesSearch(ClipDto clip)
+    {
+        var query = Search.Trim();
+        return query.Length == 0
+            || clip.Title.Contains(query, StringComparison.OrdinalIgnoreCase)
+            || (clip.Description ?? "").Contains(query, StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>What the program monitor plays: the clean clip render (vertical
     /// preferred — editor captions layer on top), else the long-form cut.</summary>
     public string? ActiveMediaUrl => ActiveClip is { } clip
         ? clip.VerticalUrl ?? clip.VideoUrl ?? clip.CaptionedUrl
         : ActiveLongform?.VideoUrl;
     public string? ActivePosterUrl => ActiveClip?.ThumbnailUrl ?? ActiveLongform?.ThumbnailUrl;
+
+    /// <summary>Publish, revise, research and thumbnail generation all run a
+    /// worker against the run mirror the ingest wrote to disk; on a machine
+    /// without it the API rejects them with a 409. Unknown ⇒ allowed, so a
+    /// missing field never disables a working button.</summary>
+    public bool WorkerActionsAvailable => Detail?.HasLocalMirror ?? true;
 
     public string SortLabel => SortBy == "score" ? "Score" : "Timeline";
     public string PlayIcon => Playing ? "❚❚" : "▶";
@@ -158,10 +181,57 @@ public class StudioState : IDisposable
         }
     }
 
+    // ---- closing the editor ---------------------------------------------- //
+
+    public bool CloseConfirmOpen { get; private set; }
+    public bool CloseBusy { get; private set; }
+    public string? CloseError { get; private set; }
+
     public void CloseEditor()
     {
+        if (Edit.ChangedSinceOpen)
+        {
+            Set(() => { CloseConfirmOpen = true; CloseError = null; });
+            return;
+        }
+        FinishClose();
+    }
+
+    /// <summary>Resolve the unsaved-changes prompt: keep the edit (flush it) or
+    /// roll the cut back to how the editor found it.</summary>
+    public async Task ConfirmCloseAsync(bool save)
+    {
+        if (CloseBusy) return;
+        Set(() => { CloseBusy = true; CloseError = null; });
+        try
+        {
+            if (save) await Edit.FlushSaveAsync(commit: true);
+            else await Edit.DiscardChangesAsync();
+            if (Edit.SaveState == "Save failed")
+            {
+                Set(() => CloseError = save
+                    ? "Couldn't save the edit — try again, or discard it."
+                    : "Couldn't restore the cut — try again.");
+                return;
+            }
+            FinishClose();
+        }
+        catch (Exception)
+        {
+            Set(() => CloseError = "Something went wrong — try again.");
+        }
+        finally
+        {
+            Set(() => CloseBusy = false);
+        }
+    }
+
+    public void CancelClose() => Set(() => { CloseConfirmOpen = false; CloseError = null; });
+
+    private void FinishClose()
+    {
         Edit.Close();
-        Set(() => { EditorOpen = false; Playing = false; });
+        Set(() => { EditorOpen = false; Playing = false; CloseConfirmOpen = false; });
         _ = GuardedAsync(RefreshDetailAsync);
     }
     public void ToggleSort() => Set(() => SortOpen = !SortOpen);
@@ -170,7 +240,6 @@ public class StudioState : IDisposable
     public void SetBinTab(string key) => Set(() => BinTab = key);
     public void SetPanel(string key) => Set(() => Panel = key);
     public void SetTool(string key) => Set(() => Tool = key);
-    public void SelectCaption(int i) => Set(() => ActiveCaption = i);
     public void SetCapStyle(string key) => Set(() => CapStyle = key);
     public void ToggleSnap() => Set(() => Snap = !Snap);
     public void TogglePlay() => Set(() => Playing = !Playing);
@@ -190,7 +259,7 @@ public class StudioState : IDisposable
         try
         {
             var list = await api.ListProjectsAsync(_cts.Token);
-            Set(() => Projects = list);
+            Set(() => Projects = list.Select(Monotonic).ToList());
         }
         catch (OperationCanceledException)
         {
@@ -229,7 +298,7 @@ public class StudioState : IDisposable
             if (ProjectId == id)
                 Set(() =>
                 {
-                    Detail = detail;
+                    Detail = detail with { Project = Monotonic(detail.Project) };
                     HydrateThumbnails();
                 });
         }
@@ -259,7 +328,7 @@ public class StudioState : IDisposable
             if (ProjectId == id)
                 Set(() =>
                 {
-                    Detail = detail;
+                    Detail = detail with { Project = Monotonic(detail.Project) };
                     DetailError = null;
                     HydrateThumbnails();
                     if (ActiveClip is { } open)
@@ -279,7 +348,7 @@ public class StudioState : IDisposable
         try
         {
             var list = await api.ListProjectsAsync(_cts.Token);
-            Set(() => { Projects = list; ProjectsError = null; });
+            Set(() => { Projects = list.Select(Monotonic).ToList(); ProjectsError = null; });
         }
         catch (Exception exception) when (
             exception is ApiException or HttpRequestException or OperationCanceledException)
@@ -421,6 +490,25 @@ public class StudioState : IDisposable
     {
         var query = Search.Trim();
         if (query.Length < 2) return;
+
+        // Inside a project, search that project — all of its highlights, from
+        // the detail already in hand, with no cap and no network.
+        if (View == "project" && Detail is { } open && open.Project.Id == ProjectId)
+        {
+            var local = new List<SearchHit>();
+            if (open.LongformEdits.FirstOrDefault(e =>
+                    e.Status == "rendered"
+                    && (e.Title ?? "").Contains(query, StringComparison.OrdinalIgnoreCase)) is { } openCut)
+                local.Add(new SearchHit("cut", open.Project.Id, open.Project.Name,
+                    openCut.Title ?? open.Project.Name, null));
+            local.AddRange(open.Clips
+                .Where(c => c.Title.Contains(query, StringComparison.OrdinalIgnoreCase)
+                    || (c.Description ?? "").Contains(query, StringComparison.OrdinalIgnoreCase))
+                .Select(c => new SearchHit("highlight", open.Project.Id, open.Project.Name, c.Title, c.Id)));
+            Set(() => SearchHits = local.Take(30).ToList());
+            return;
+        }
+
         var projects = Projects ?? await api.ListProjectsAsync(_cts.Token);
         var recent = projects.Take(12).ToList();
         foreach (var chunk in recent.Where(p => !_searchCache.ContainsKey(p.Id)).Chunk(4))
@@ -477,6 +565,29 @@ public class StudioState : IDisposable
                 OpenEditorLong();
             }
         });
+    }
+
+    // ---- progress ---------------------------------------------------------- //
+
+    private readonly Dictionary<Guid, double> _progressFloor = [];
+
+    /// <summary>Keep a project's progress bar from ever moving backwards. The
+    /// percent is derived per request from a chunk count and a stage marker, so
+    /// a stale poll or a stage handoff can otherwise report a smaller number
+    /// than the one already on screen.</summary>
+    private ProjectSummaryDto Monotonic(ProjectSummaryDto p)
+    {
+        if (!p.Processing)
+        {
+            _progressFloor.Remove(p.Id);
+            return p;
+        }
+        if (p.Progress.Percent is not { } percent) return p;
+        var floor = _progressFloor.TryGetValue(p.Id, out var seen) ? Math.Max(seen, percent) : percent;
+        _progressFloor[p.Id] = floor;
+        return floor > percent
+            ? p with { Progress = p.Progress with { Percent = floor } }
+            : p;
     }
 
     private void EnsurePolling()
@@ -546,10 +657,16 @@ public class StudioState : IDisposable
 
     public void SelectThumb(int index) => Set(() => SelectedThumb = index);
     public void ToggleThumbPrompt() => Set(() => { ThumbPromptOpen = !ThumbPromptOpen; ThumbError = null; });
+
+    /// <summary>Open the generate panel primed to retry a concept that failed.</summary>
+    public void RetryThumb(string direction) => Set(() =>
+    {
+        ThumbPrompt = $"Retry this concept: {direction}";
+        ThumbPromptOpen = true;
+        ThumbError = null;
+    });
     public void SetThumbJob(bool running, string? error = null) =>
         Set(() => { ThumbJobRunning = running; ThumbError = error; });
-    public void AddThumb(ThumbVariant variant) =>
-        Set(() => { Thumbnails.Add(variant); ThumbPromptOpen = false; ThumbPrompt = ""; });
 
     /// <summary>Real thumbnail variants from the latest long-form edit; called
     /// whenever Detail lands. Fill carries the rendered image when hosted.</summary>
@@ -562,33 +679,23 @@ public class StudioState : IDisposable
             Thumbnails.Add(new ThumbVariant(
                 variant.Index,
                 variant.Direction ?? $"Concept {variant.Index}",
-                variant.Url is null ? variant.OverlayText ?? "" : "",
+                variant.Url is null && variant.Error is null ? variant.OverlayText ?? "" : "",
                 variant.Url is { } url
                     ? $"#191817 url('{url}') center/cover no-repeat"
-                    : "linear-gradient(135deg, #223047 0%, #3A2B52 60%, #D9F24B 140%)"));
+                    : variant.Error is not null
+                        ? "#1C1B19"
+                        : "linear-gradient(135deg, #223047 0%, #3A2B52 60%, #D9F24B 140%)",
+                variant.Error));
         }
+        // A failed variant can never be the selection.
         SelectedThumb = edit?.SelectedThumbnail
-            ?? (Thumbnails.Count > 0 ? Thumbnails[0].Index : 0);
+            ?? Thumbnails.FirstOrDefault(t => t.Error is null)?.Index
+            ?? 0;
     }
 
-    // ---- Per-clip delivery options -------------------------------------- //
-
-    private readonly Dictionary<Guid, string> _clipFormats = [];
-    private readonly Dictionary<Guid, bool> _clipCaptions = [];
-    private Guid ActiveClipKey => ActiveClip?.Id ?? Guid.Empty;
-
-    public string ClipFormat => _clipFormats.GetValueOrDefault(ActiveClipKey, "auto");
-    public bool ClipCaptionsOn =>
-        CaptionsAvailableForFormat && _clipCaptions.GetValueOrDefault(ActiveClipKey, true);
-
-    /// <summary>Captions ride the vertical and square renders; the wide 16:9
-    /// ships clean. A clip without a captioned render has none to offer.</summary>
-    public bool CaptionsAvailableForFormat =>
-        ClipFormat is "auto" or "square" && ActiveClip?.CaptionedUrl is not null;
-
-    public void SetClipFormat(string format) => Set(() => _clipFormats[ActiveClipKey] = format);
-    public void ToggleClipCaptions() =>
-        Set(() => _clipCaptions[ActiveClipKey] = !_clipCaptions.GetValueOrDefault(ActiveClipKey, true));
+    // Delivery format and the captions toggle live on the EDL document
+    // (EditorSession.SetFormat / SetCaptionsEnabled) so they persist and reach
+    // the renderer — they used to be per-circuit dictionaries nothing read.
 
     // ---- Publish modal --------------------------------------------------- //
 

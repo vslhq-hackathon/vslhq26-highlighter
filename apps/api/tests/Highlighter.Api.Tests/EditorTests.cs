@@ -111,6 +111,93 @@ public class EditorDocsTests
         Assert.Equal(doc.Audio, restored.Audio);
         Assert.Equal("manual", restored.Reframe);
     }
+
+    [Fact]
+    public void Normalize_DefaultsFormatAndCaptions()
+    {
+        // A document persisted before formats existed omits both fields; it has
+        // to keep exporting exactly as it used to (source geometry, captions on).
+        var legacy = EditorDocs.FromJson(JsonNode.Parse("""
+            {"v":1,"segments":[{"id":"s1","srcStart":0,"srcEnd":10}],"captions":[],
+             "captionStyle":"boxed","texts":[],"markers":[],
+             "transform":{"scale":1,"posX":0},"audio":{"voice":1,"music":0},"reframe":"auto"}
+            """));
+
+        Assert.NotNull(legacy);
+        Assert.Equal("source", legacy!.Format);
+        Assert.True(legacy.CaptionsEnabled);
+        Assert.Null(EditorDocs.Validate(legacy, 10));
+    }
+
+    [Theory]
+    [InlineData("source", null)]
+    [InlineData("vertical", null)]
+    [InlineData("square", null)]
+    [InlineData("wide", null)]
+    [InlineData("portrait", "format must be")]
+    public void Validate_ChecksFormat(string format, string? expectError)
+    {
+        var doc = EditorDocs.Default(30, []) with { Format = format };
+        var error = EditorDocs.Validate(doc, 30);
+        if (expectError is null) Assert.Null(error);
+        else Assert.Contains(expectError, error);
+    }
+
+    [Fact]
+    public void SeedCaptions_AcrossStitchedSegments_LandsAtCumulativeOffsets()
+    {
+        // A stitched cut plays its kept source windows back to back, so the
+        // second window's lines belong at the first window's duration, not at
+        // their original source time.
+        var chunk = new JsonObject
+        {
+            ["words"] = new JsonArray(
+                Word("first", 30.0, 30.5), Word("window", 30.6, 31.0),
+                Word("second", 120.0, 120.5), Word("window", 120.6, 121.0)),
+        };
+        (double Start, double End)[] segments = [(29, 87), (118, 242)];
+
+        var captions = new List<EdlCaption>();
+        double elapsed = 0;
+        foreach (var (start, end) in segments)
+        {
+            captions.AddRange(EditorDocs.OffsetCaptions(
+                EditorDocs.SeedCaptions([chunk], start, end), elapsed, captions.Count + 1));
+            elapsed += end - start;
+        }
+
+        Assert.Equal(2, captions.Count);
+        // 30.0 is 1s into the first window, which starts the cut.
+        Assert.Equal(1.0, captions[0].Start, 3);
+        // 120.0 is 2s into the second window, which starts 58s into the cut.
+        Assert.Equal(60.0, captions[1].Start, 3);
+        Assert.Equal(60.0, captions[1].Words![0].S, 3);
+        Assert.Equal(["c1", "c2"], captions.Select(c => c.Id));
+
+        static JsonNode Word(string text, double start, double end) => new JsonObject
+        {
+            ["punctuated_word"] = text,
+            ["absolute_start"] = start,
+            ["absolute_end"] = end,
+        };
+    }
+
+    [Fact]
+    public void OffsetCaptions_ShiftsWindowsAndRenumbers()
+    {
+        var seeded = new List<EdlCaption>
+        {
+            new("c1", 0, 1, "first", [new EdlWord("first", 0, 1)]),
+            new("c2", 2, 3, "second", [new EdlWord("second", 2, 3)]),
+        };
+
+        var shifted = EditorDocs.OffsetCaptions(seeded, offset: 12.5, startIndex: 4);
+
+        Assert.Equal(["c4", "c5"], shifted.Select(c => c.Id));
+        Assert.Equal(12.5, shifted[0].Start, 3);
+        Assert.Equal(14.5, shifted[1].Start, 3);
+        Assert.Equal(12.5, shifted[0].Words![0].S, 3);
+    }
 }
 
 public class EditorRendererTests
@@ -240,6 +327,80 @@ public class EditorRendererTests
         var degraded = EditorRenderer.PlanOverlays(doc, maxInputs: 1);
         var single = Assert.Single(degraded);
         Assert.Equal(2, single.HighlightWords);
+    }
+
+    [Fact]
+    public void PlanOverlays_SkipsCaptionsWhenDisabled()
+    {
+        var doc = EditorDocs.Default(60, [new EdlCaption("c1", 1, 3, "spoken line")]) with
+        {
+            Texts = [new EdlText("t1", 2, 4, "TITLE")],
+            CaptionsEnabled = false,
+        };
+
+        var plan = EditorRenderer.PlanOverlays(doc);
+
+        var only = Assert.Single(plan);
+        Assert.Equal("text", only.Kind);
+    }
+
+    [Theory]
+    [InlineData("vertical", 1080, 1920)]
+    [InlineData("square", 1080, 1080)]
+    [InlineData("wide", 1920, 1080)]
+    [InlineData("source", 1080, 1920)] // Vertical's own geometry
+    public void OutputDims_FollowFormat(string format, int width, int height)
+    {
+        var doc = EditorDocs.Default(60, []) with { Format = format };
+        Assert.Equal((width, height), EditorRenderer.OutputDims(doc, Vertical));
+    }
+
+    [Fact]
+    public void FilterGraph_AutoFormat_BlurPadsIntoTarget()
+    {
+        // A 16:9 master delivered as 9:16: nothing may be cropped away, so the
+        // frame fits inside and the margins get a blurred copy.
+        var source = new EditorRenderer.SourceInfo(60, 1280, 720, HasAudio: true);
+        var doc = EditorDocs.Default(60, []) with { Format = "vertical", Reframe = "auto" };
+
+        var graph = EditorRenderer.BuildFilterGraph(doc, source, [], 1);
+
+        Assert.Contains("[vcat]split=2[vbg][vfg]", graph);
+        Assert.Contains("force_original_aspect_ratio=increase", graph);
+        Assert.Contains("gblur=sigma=28", graph);
+        Assert.Contains("scale=1080:1920:force_original_aspect_ratio=decrease", graph);
+        Assert.Contains("[vbgb][vfgs]overlay=x=(main_w-overlay_w)/2:y=(main_h-overlay_h)/2[vbase]", graph);
+    }
+
+    [Fact]
+    public void FilterGraph_ManualFormat_PansAtZoomOne()
+    {
+        // The old code only cropped when scale > 1, so Position X did nothing at
+        // 1x. Against a target aspect it must pan on its own.
+        var source = new EditorRenderer.SourceInfo(60, 1920, 1080, HasAudio: true);
+        var doc = EditorDocs.Default(60, []) with
+        {
+            Format = "vertical",
+            Reframe = "manual",
+            Transform = new EdlTransform(Scale: 1.0, PosX: -1.0),
+        };
+
+        var graph = EditorRenderer.BuildFilterGraph(doc, source, [], 1);
+
+        Assert.Contains("crop=w=min(iw\\,ih*1080/1920)/1:h=min(ih\\,iw*1920/1080)/1", graph);
+        Assert.Contains(":x=(iw-(min(iw\\,ih*1080/1920)/1))*0", graph); // posX -1 => hard left
+        Assert.Contains("scale=1080:1920,setsar=1", graph);
+    }
+
+    [Fact]
+    public void FilterGraph_SourceFormat_IsUnchangedByTheFormatStage()
+    {
+        // Documents saved before formats existed must render byte-identically.
+        var doc = EditorDocs.Default(60, []) with { Format = "source" };
+        var graph = EditorRenderer.BuildFilterGraph(doc, Vertical, [], 1);
+
+        Assert.Contains("[vcat]null[vbase]", graph);
+        Assert.DoesNotContain("split=2", graph);
     }
 
     [Fact]

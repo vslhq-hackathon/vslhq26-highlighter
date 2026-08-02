@@ -3,17 +3,25 @@
 @implements IAsyncDisposable
 
 @* EDL-aware program monitor: plays the clean source while studio.js skips cut
-   regions and applies per-segment speed; scale/pan preview via CSS transform;
-   captions and text overlays render live from the document at the playhead. *@
+   regions and applies per-segment speed; the delivery format and manual
+   zoom/pan compose the frame the way the export does; captions are painted
+   client-side (studio.js) so the karaoke sweep tracks the real playhead. *@
 
 <div class="anim-fade-up flex min-w-0 flex-1 flex-col bg-[#0D0C0B]" style="animation-delay:90ms">
     <div class="flex min-h-0 flex-1 items-center justify-center p-[18px] [container-type:size]">
         <div class="relative @AspectClasses overflow-hidden border border-line bg-[repeating-linear-gradient(-45deg,#191817_0_12px,#1D1B19_12px_24px)]">
             @if (MediaUrl is { } mediaUrl)
             {
+                @if (BlurPad && S.ActivePosterUrl is { } posterUrl)
+                {
+                    @* Stand-in for the export's blurred margins. A second synced
+                       <video> would be exact and far more machinery. *@
+                    <img src="@posterUrl" alt="" aria-hidden="true"
+                         class="absolute inset-0 h-full w-full scale-110 object-cover blur-xl brightness-[0.55]" />
+                }
                 <video @ref="_video" @key="mediaUrl" src="@mediaUrl" poster="@S.ActivePosterUrl"
                        playsinline preload="metadata"
-                       class="absolute inset-0 h-full w-full bg-black object-contain"
+                       class="absolute inset-0 h-full w-full @(BlurPad ? "" : "bg-black") @VideoFit"
                        style="@TransformStyle"
                        @onclick="S.TogglePlay"
                        @onplay="() => S.SetPlaying(true)"
@@ -30,65 +38,41 @@
                 </div>
             }
 
-            @* live EDL text overlays *@
-            @foreach (var text in ActiveTexts)
-            {
-                <div class="pointer-events-none absolute left-[5%] right-[5%] z-10 text-center" style="top:@($"{text.Y * 100:0.#}%")">
-                    <span class="text-[13px] font-extrabold uppercase leading-[1.2] text-fg [text-shadow:0_1px_3px_#141312,0_0_10px_#141312]">@text.Text</span>
-                </div>
-            }
-
-            @* live EDL caption at the playhead *@
-            @if (ActiveCaption is { } caption)
-            {
-                <div class="pointer-events-none absolute bottom-[12%] left-[8%] right-[8%] z-10 text-center">
-                    @if (Style == "boxed")
-                    {
-                        <span class="rounded-[3px] bg-ink px-[7px] py-[3px] text-[15px] font-extrabold leading-[1.55] text-fg [box-decoration-break:clone] [-webkit-box-decoration-break:clone]">@caption.Text</span>
-                    }
-                    @if (Style == "plain")
-                    {
-                        <span class="text-[15px] font-extrabold leading-[1.55] text-fg [text-shadow:0_1px_3px_#141312,0_0_12px_#141312]">@caption.Text</span>
-                    }
-                    @if (Style == "karaoke")
-                    {
-                        <span class="text-[15px] font-extrabold leading-[1.55] text-muted [text-shadow:0_1px_3px_#141312]">
-                            @foreach (var word in caption.Words ?? [])
-                            {
-                                <span class="@(word.S <= E.Playhead ? "text-accent" : "")">@word.T </span>
-                            }
-                            @if (caption.Words is null or { Count: 0 })
-                            {
-                                @caption.Text
-                            }
-                        </span>
-                    }
-                </div>
-            }
+            @* Overlay stage. Its own size container, so captions can be sized in
+               cqh against the frame the way the export sizes them against the
+               delivered height. *@
+            <div class="pointer-events-none absolute inset-0 z-10 [container-type:size]">
+                @foreach (var text in ActiveTexts)
+                {
+                    @* Not uppercased: the export burns the text as typed. *@
+                    <div class="absolute left-[5%] right-[5%] text-center" style="top:@($"{text.Y * 100:0.#}%")">
+                        <span class="text-[13px] font-extrabold leading-[1.2] text-fg [text-shadow:0_1px_3px_#141312,0_0_10px_#141312]">@text.Text</span>
+                    </div>
+                }
+                <div @ref="_captionLayer" class="absolute bottom-[12%] left-[8%] right-[8%] text-center"></div>
+            </div>
         </div>
     </div>
     <div class="flex min-w-0 items-center gap-2.5 px-3.5 pb-3 pt-2">
         <span class="min-w-0 shrink overflow-hidden font-mono text-[13px] tracking-[0.03em] text-accent">@Fmt.Timecode(E.Doc is null ? _playhead : E.PlayheadOutput, E.Fps)</span>
+        @* Frame steps and 5-second skips only. The old ⏮/⏭ jumped to the
+           previous/next edit point, which read as "back to the start". *@
         <div class="flex min-w-0 flex-1 items-center justify-center gap-2.5">
-            <span title="Mark in — trim the segment start to here (I)" @onclick="E.MarkIn" class="cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟦</span>
-            <span title="Previous edit point (↑)" @onclick="() => E.JumpEdit(-1)" class="cursor-pointer text-[13px] text-muted hover:text-fg">⏮</span>
-            <span title="Back 5 seconds (PgUp / Alt+←)" @onclick="() => E.StepOutput(-5)" class="cursor-pointer font-mono text-[10.5px] text-muted hover:text-fg">«5</span>
-            <span title="Back one frame (←)" @onclick="() => SeekBy(-E.FrameStep)" class="cursor-pointer text-[13px] text-muted hover:text-fg">◀</span>
-            <span @onclick="TogglePlayButton" class="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-fg text-xs text-ink hover:bg-white active:scale-90 @(MediaUrl is null ? "pointer-events-none opacity-40" : "")">@S.PlayIcon</span>
+            <span data-tip="Mark in" @onclick="E.MarkIn" class="tip cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟦</span>
+            <span data-tip="Back 5s" @onclick="() => E.StepOutput(-5)" class="tip cursor-pointer text-[13px] text-muted hover:text-fg">⏮</span>
+            <span data-tip="Back 1 frame" @onclick="() => SeekBy(-E.FrameStep)" class="tip cursor-pointer text-[13px] text-muted hover:text-fg">◀</span>
+            <span data-tip="@(S.Playing ? "Pause" : "Play")" @onclick="TogglePlayButton" class="tip flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-fg text-xs text-ink hover:bg-white active:scale-90 @(MediaUrl is null ? "pointer-events-none opacity-40" : "")">@S.PlayIcon</span>
             @if (E.ShuttleRate is not 1)
             {
                 <span class="rounded-[3px] border border-line2 px-1.5 py-0.5 font-mono text-[10px] text-accent">@(E.ShuttleRate < 0 ? $"◂×{Math.Abs(E.ShuttleRate):0.#}" : $"×{E.ShuttleRate:0.#}")</span>
             }
-            <span title="Forward one frame (→)" @onclick="() => SeekBy(E.FrameStep)" class="cursor-pointer text-[13px] text-muted hover:text-fg">▶</span>
-            <span title="Forward 5 seconds (PgDn / Alt+→)" @onclick="() => E.StepOutput(5)" class="cursor-pointer font-mono text-[10.5px] text-muted hover:text-fg">5»</span>
-            <span title="Next edit point (↓)" @onclick="() => E.JumpEdit(1)" class="cursor-pointer text-[13px] text-muted hover:text-fg">⏭</span>
-            <span title="Mark out — trim the segment end to here (O)" @onclick="E.MarkOut" class="cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟧</span>
+            <span data-tip="Forward 1 frame" @onclick="() => SeekBy(E.FrameStep)" class="tip cursor-pointer text-[13px] text-muted hover:text-fg">▶</span>
+            <span data-tip="Forward 5s" @onclick="() => E.StepOutput(5)" class="tip cursor-pointer text-[13px] text-muted hover:text-fg">⏭</span>
+            <span data-tip="Mark out" @onclick="E.MarkOut" class="tip cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟧</span>
         </div>
+        @* No level meter: the two bars that used to sit here were a fixed CSS
+           gradient that never moved with the audio. *@
         <div class="flex min-w-0 shrink items-center justify-end gap-2 overflow-hidden">
-            <div class="flex h-4 shrink-0 items-end gap-0.5">
-                <div class="h-full w-[3px] bg-[linear-gradient(to_top,#5E6E33_0_62%,#D9F24B_62%_78%,#242220_78%)]"></div>
-                <div class="h-full w-[3px] bg-[linear-gradient(to_top,#5E6E33_0_48%,#D9F24B_48%_60%,#242220_60%)]"></div>
-            </div>
             <span class="whitespace-nowrap font-mono text-[11px] text-faint">@Fmt.Timecode(E.Doc is null ? _duration : E.OutputDuration, E.Fps)</span>
         </div>
     </div>
@@ -96,6 +80,7 @@
 
 @code {
     private ElementReference _video;
+    private ElementReference _captionLayer;
     private IJSObjectReference? _module;
     private DotNetObjectReference<ProgramMonitor>? _self;
     private bool _wasPlaying;
@@ -108,36 +93,58 @@
     private string? MediaUrl => E.PreviewOverrideUrl ?? E.Meta?.SourceUrl ?? S.ActiveMediaUrl;
     private string Style => E.Doc?.CaptionStyle ?? S.CapStyle;
 
-    string AspectClasses => S.ActiveClip is null
-        ? "aspect-video w-[min(100%,177.7cqh)]"
-        : S.ClipFormat switch
-        {
-            "square" => "aspect-square h-[min(100%,100cqw)]",
-            "wide" => "aspect-video w-[min(100%,177.7cqh)]",
-            _ => "aspect-[9/16] h-[min(100%,177.7cqw)]",
-        };
+    private string Format => E.Doc?.Format ?? "source";
+    private bool Targeted => Format is "vertical" or "square" or "wide";
+    private bool Manual => E.Doc?.Reframe == "manual";
 
-    string FormatLabel => S.ActiveClip is null ? "16:9" : S.ClipFormat switch
+    /// <summary>Auto reframe into a delivery format letterboxes the frame over a
+    /// blurred fill — the same composition the renderer builds.</summary>
+    private bool BlurPad => Targeted && !Manual;
+
+    /// <summary>Manual reframe crops to the target box (object-cover); every
+    /// other case shows the whole frame.</summary>
+    private string VideoFit => Targeted && Manual ? "object-cover" : "object-contain";
+
+    string AspectClasses => Format switch
     {
-        "square" => "1:1",
-        "wide" => "16:9",
-        _ => "9:16",
+        "vertical" => "aspect-[9/16] h-[min(100%,177.7cqw)]",
+        "square" => "aspect-square h-[min(100%,100cqw)]",
+        "wide" => "aspect-video w-[min(100%,177.7cqh)]",
+        // "source": whatever the media itself is. Long-form cuts and
+        // master-backed clips (the ones with handle material) are 16:9.
+        _ => S.ActiveClip is null || E.Meta?.Handles is not null
+            ? "aspect-video w-[min(100%,177.7cqh)]"
+            : "aspect-[9/16] h-[min(100%,177.7cqw)]",
     };
 
-    // Manual-reframe preview: scale about a horizontal origin that matches the
-    // renderer's crop window.
+    string FormatLabel => Format switch
+    {
+        "vertical" => "9:16",
+        "square" => "1:1",
+        "wide" => "16:9",
+        _ => "source",
+    };
+
+    /// <summary>Mirrors the renderer's framing: pan slides the crop window
+    /// horizontally (works at 1× against a target aspect, because object-cover
+    /// is already cropping), zoom scales about the same origin.</summary>
     private string TransformStyle
     {
         get
         {
-            if (E.Doc is not { Reframe: "manual" } doc || doc.Transform.Scale <= 1.001) return "";
+            if (E.Doc is not { } doc) return "";
             var origin = Math.Clamp(0.5 + doc.Transform.PosX / 2.0, 0, 1) * 100;
-            return $"transform:scale({doc.Transform.Scale:0.###});transform-origin:{origin:0.#}% 50%";
+            var zoomed = doc.Transform.Scale > 1.001
+                ? $"transform:scale({doc.Transform.Scale:0.###});transform-origin:{origin:0.#}% 50%"
+                : "";
+            if (Targeted && Manual)
+            {
+                var pan = $"object-position:{origin:0.#}% 50%";
+                return zoomed.Length > 0 ? $"{pan};{zoomed}" : pan;
+            }
+            return Manual ? zoomed : "";
         }
     }
-
-    private EdlCaption? ActiveCaption => E.Doc?.Captions
-        .FirstOrDefault(c => E.Playhead >= c.Start && E.Playhead <= c.End);
 
     private IEnumerable<EdlText> ActiveTexts => E.Doc?.Texts
         .Where(t => E.Playhead >= t.Start && E.Playhead <= t.End) ?? [];
@@ -145,6 +152,8 @@
     private bool _disposed;
     private double _lastVolume = -1;
     private double _lastShuttle = 1;
+    private double _lastMusic = -1;
+    private int _pushedCaptionRevision = -1;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -158,11 +167,15 @@
             var segmentsJson = SegmentsJson();
             if (_watchedUrl != MediaUrl || _watchedSegments != segmentsJson)
             {
+                var rewatched = _watchedUrl != MediaUrl;
                 _watchedUrl = MediaUrl;
                 _watchedSegments = segmentsJson;
                 await _module.InvokeVoidAsync("watch", _video, _self, SegmentsPayload());
                 _duration = await _module.InvokeAsync<double>("getDuration", _video);
                 _lastShuttle = 1; // watch() rebuilt the JS state
+                // A new media URL means a new <video> element, and the caption
+                // engine keys its state off the element.
+                if (rewatched) { _pushedCaptionRevision = -1; _lastMusic = -1; }
             }
             if (_duration <= 0)
                 _duration = await _module.InvokeAsync<double>("getDuration", _video);
@@ -170,11 +183,25 @@
             if (E.ConsumeSeek() is { } seek)
                 await _module.InvokeVoidAsync("seek", _video, seek);
 
+            if (_pushedCaptionRevision != E.DocRevision)
+            {
+                _pushedCaptionRevision = E.DocRevision;
+                await _module.InvokeVoidAsync("setCaptions", _video, _captionLayer,
+                    CaptionsPayload(), Style, E.Doc?.CaptionsEnabled ?? true);
+            }
+
             var volume = E.Doc?.Audio.Voice ?? 1.0;
             if (Math.Abs(volume - _lastVolume) > 0.001)
             {
                 _lastVolume = volume;
                 await _module.InvokeVoidAsync("setVolume", _video, volume);
+            }
+
+            var music = E.Doc?.Audio.Music ?? 0;
+            if (Math.Abs(music - _lastMusic) > 0.001)
+            {
+                _lastMusic = music;
+                await _module.InvokeVoidAsync("setMusicBed", _video, music);
             }
 
             if (S.Playing != _wasPlaying)
@@ -208,6 +235,19 @@
     private object[] SegmentsPayload() => E.Doc is null
         ? []
         : E.Doc.Segments.Select(s => (object)new { start = s.SrcStart, end = s.SrcEnd, speed = s.Speed }).ToArray();
+
+    /// <summary>Caption lines for the client-side painter. Times are SOURCE
+    /// seconds — the same clock the &lt;video&gt; reports.</summary>
+    private object[] CaptionsPayload() => E.Doc is null
+        ? []
+        : E.Doc.Captions.Select(c => (object)new
+        {
+            id = c.Id,
+            start = c.Start,
+            end = c.End,
+            text = c.Text,
+            words = c.Words?.Select(w => new { t = w.T, s = w.S, e = w.E }).ToArray(),
+        }).ToArray();
 
     [JSInvokable]
     public async Task OnPlayhead(double seconds)

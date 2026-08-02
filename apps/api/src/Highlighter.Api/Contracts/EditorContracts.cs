@@ -24,6 +24,12 @@ public record EdlTransform(double Scale = 1.0, double PosX = 0.0);
 /// generated ambient bed under it (0 = off .. 1).</summary>
 public record EdlAudio(double Voice = 1.0, double Music = 0.0);
 
+/// <param name="Format">Delivery aspect: "vertical" (1080×1920), "square"
+/// (1080×1080), "wide" (1920×1080), or "source" — keep the media's own
+/// geometry. Absent on documents saved before formats existed, which normalize
+/// to "source" so their exports stay byte-for-byte what they used to be.</param>
+/// <param name="CaptionsEnabled">Burn captions on export (and show them in the
+/// preview). Absent means enabled.</param>
 public record EditorDoc(
     int V,
     IReadOnlyList<EdlSegment> Segments,
@@ -33,7 +39,9 @@ public record EditorDoc(
     IReadOnlyList<EdlMarker> Markers,
     EdlTransform Transform,
     EdlAudio Audio,
-    string Reframe);
+    string Reframe,
+    string? Format = null,
+    bool? CaptionsEnabled = null);
 
 /// <summary>The last export of this document, if any.</summary>
 public record EditorExportInfoDto(

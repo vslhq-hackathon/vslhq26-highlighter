@@ -139,6 +139,16 @@ public static class Thumbnails
                 catch (Exception exc)
                 {
                     Console.WriteLine($"Thumbnail {number} generation failed (non-fatal): {exc.Message}");
+                    // Keep the slot with its error. Dropping it left a hole in
+                    // the numbering ("#1, #3") that the studio could neither
+                    // explain nor retry.
+                    generated[slot] = new JsonObject
+                    {
+                        ["index"] = number,
+                        ["direction"] = JsonUtil.C(concept["direction"]),
+                        ["overlay_text"] = JsonUtil.C(concept["overlay_text"]),
+                        ["error"] = exc.Message,
+                    };
                 }
             }));
         }
@@ -148,12 +158,23 @@ public static class Thumbnails
             if (variant is not null) variants.Add(variant);
 
         if (variants.Count == 0) return null;
-        var selected = Random.Shared.Next(variants.Count);
+        var usable = variants
+            .OfType<JsonObject>()
+            .Where(variant => JsonUtil.Truthy(variant["local_path"]))
+            .ToList();
+        if (usable.Count == 0)
+        {
+            Console.WriteLine($"All {variants.Count} thumbnail variant(s) failed to generate.");
+            return new JsonObject { ["variants"] = variants };
+        }
+        // selected_index is the variant's own stable number, not its position in
+        // the list — positions shift whenever a variant fails or is imported.
+        var selected = JsonUtil.Double(usable[Random.Shared.Next(usable.Count)]["index"]);
         Console.WriteLine(
-            $"Generated {variants.Count} thumbnail variant(s); "
-            + $"defaulting to #{JsonUtil.Str(variants[selected]!["index"])} "
-            + $"({JsonUtil.Str(variants[selected]!["direction"])})");
-        return new JsonObject { ["variants"] = variants, ["selected_index"] = selected };
+            $"Generated {usable.Count} thumbnail variant(s)"
+            + (usable.Count < variants.Count ? $", {variants.Count - usable.Count} failed" : "")
+            + $"; defaulting to #{(int)selected}");
+        return new JsonObject { ["variants"] = variants, ["selected_index"] = (int)selected };
     }
 
     private static List<JsonObject> ThumbnailConcepts(

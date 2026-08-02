@@ -91,12 +91,12 @@ public class ApiStudioBackend(StudioState state, ApiClient api) : IStudioBackend
         if (state.ProjectId is not { } id) return "No project is open.";
         try
         {
-            var job = await api.PostJobAsync($"/api/projects/{id}/thumbnails/select", new { index });
+            // A straight metadata write server-side — no worker, so this works
+            // without a local run mirror.
+            await api.PostAsync<LongformEditDto>(
+                $"/api/projects/{id}/thumbnails/select", new { index });
             await state.RefreshDetailAsync();
-            return job.State == "succeeded"
-                ? $"Thumbnail #{index} is now the video's thumbnail."
-                : $"Selection did not finish cleanly (job {job.Id}: {job.State}"
-                  + $"{(job.FailureReason is { } why ? $", {why}" : "")}).";
+            return $"Thumbnail #{index} is now the video's thumbnail.";
         }
         catch (ApiException exception)
         {

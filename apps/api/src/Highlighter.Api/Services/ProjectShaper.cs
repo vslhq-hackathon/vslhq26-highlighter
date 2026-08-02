@@ -34,7 +34,8 @@ public static class ProjectShaper
             ChunkCount: chunkCount,
             LongformCount: EmbedCount(row["longform_edits"]),
             Processing: status is "created" or "ingesting" or "stopping",
-            Progress: BuildProgress(status, chunkCount, sourceMinutes, chunkSeconds, maxChunks),
+            Progress: BuildProgress(status, chunkCount, sourceMinutes, chunkSeconds, maxChunks,
+                Str((metadata?["progress"] as JsonObject)?["stage"])),
             ActiveJobId: activeJobId,
             CreatedAt: Ts(row["created_at"]),
             UpdatedAt: Ts(row["updated_at"]),
@@ -66,8 +67,26 @@ public static class ProjectShaper
             LongformEdits: Rows(row["longform_edits"]).Select(Longform).ToList(),
             Publications: Rows(row["publications"]).Select(Publication).ToList());
 
+    /// <summary>Where each finishing phase sits on the bar. Capture (transcript
+    /// chunks) is the only phase with a real fraction, so it owns the first
+    /// CaptureShare; everything after it is a single long step that gets a fixed
+    /// landmark. Without this the bar reached 100% the moment the last chunk
+    /// stored and sat there through the edit LLM call, the stitch, and four
+    /// image generations.</summary>
+    private const double CaptureShare = 0.72;
+
+    private static readonly Dictionary<string, double> TailStages = new()
+    {
+        ["finishing"] = 0.75,
+        ["editing"] = 0.80,
+        ["stitching"] = 0.86,
+        ["thumbnails"] = 0.90,
+        ["uploading"] = 0.96,
+    };
+
     public static ProgressDto BuildProgress(
-        string status, int chunksStored, double? sourceMinutes, double chunkSeconds, int maxChunks)
+        string status, int chunksStored, double? sourceMinutes, double chunkSeconds, int maxChunks,
+        string? workerStage = null)
     {
         var stage = status == "created" ? "queued" : status;
         int? expected = null;
@@ -80,10 +99,19 @@ public static class ProjectShaper
         {
             expected = maxChunks;
         }
-        var percent = status == "ready" ? 1.0
-            : expected is > 0 ? Math.Min(1.0, chunksStored / (double)expected.Value)
+
+        if (status == "ready") return new ProgressDto(stage, 1.0, chunksStored, expected);
+        if (status != "ingesting") return new ProgressDto(stage, null, chunksStored, expected);
+
+        // A worker that predates the stage markers reports nothing here; the
+        // capture fraction alone is exactly the old behavior.
+        if (workerStage is { } marker && TailStages.TryGetValue(marker, out var landmark))
+            return new ProgressDto(marker, landmark, chunksStored, expected);
+
+        var captured = expected is > 0
+            ? Math.Min(1.0, chunksStored / (double)expected.Value) * CaptureShare
             : (double?)null;
-        return new ProgressDto(stage, percent, chunksStored, expected);
+        return new ProgressDto(workerStage ?? stage, captured, chunksStored, expected);
     }
 
     public static ClipDto Clip(JsonObject row)
@@ -119,14 +147,19 @@ public static class ProjectShaper
                 IntOrNull(variant["index"]) ?? 0,
                 Str(variant["direction"]),
                 Str(variant["overlay_text"]),
-                Str(variant["url"])))
+                Str(variant["url"]),
+                Str(variant["error"])))
             .ToList();
-        // selected_index is the LIST position (the worker stores IndexOf); expose
-        // the variant's stable Index number instead.
-        var selectedPosition = IntOrNull(thumbnails?["selected_index"]);
-        int? selected = selectedPosition is { } position && position >= 0 && position < variants.Count
-            ? variants[position].Index
-            : null;
+        // selected_index is now the variant's stable number. Rows written before
+        // that change hold a LIST position; indices start at 1, so a 0 (or any
+        // value that matches no variant) is read the old way.
+        var raw = IntOrNull(thumbnails?["selected_index"]);
+        int? selected = raw switch
+        {
+            { } value when variants.Any(v => v.Index == value) => value,
+            { } position when position >= 0 && position < variants.Count => variants[position].Index,
+            _ => null,
+        };
 
         return new LongformEditDto(
             Id: Guid.Parse(Str(row["id"])!),

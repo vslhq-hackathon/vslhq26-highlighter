@@ -355,8 +355,13 @@ public static class Revise
         if (thumbnails["variants"] is not JsonArray variants) return null;
         if (!JsonUtil.TryDouble(thumbnails["selected_index"], out var indexValue)) return null;
         var index = (int)indexValue;
-        if (index < 0 || index >= variants.Count) return null;
-        var url = JsonUtil.StrOrNull((variants[index] as JsonObject)?["url"]);
+        // selected_index is the variant's stable number. Rows written before
+        // that change hold a list position; numbers start at 1, so a value
+        // matching no variant is read the old way.
+        var chosen = variants.OfType<JsonObject>().FirstOrDefault(variant =>
+            JsonUtil.TryDouble(variant["index"], out var number) && (int)number == index)
+            ?? (index >= 0 && index < variants.Count ? variants[index] as JsonObject : null);
+        var url = JsonUtil.StrOrNull(chosen?["url"]);
         return string.IsNullOrEmpty(url) ? null : url;
     }
 

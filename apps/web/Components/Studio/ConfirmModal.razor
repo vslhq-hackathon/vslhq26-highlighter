@@ -1,0 +1,59 @@
+@* One confirm dialog for the studio's destructive and lose-your-work actions:
+   a question, a sentence of consequence, and the two ways out. *@
+
+<div @onclick="Cancel" class="anim-fade-in absolute inset-0 z-[70] flex items-center justify-center bg-[rgba(10,9,8,0.72)]">
+    <div @onclick:stopPropagation class="anim-scale-in w-[416px] rounded-[10px] border border-line3 bg-card2 shadow-[0_24px_60px_rgba(0,0,0,0.55)]">
+        <div class="px-6 pb-6 pt-[22px]">
+            <div class="flex items-start justify-between gap-4">
+                <div class="text-[15px] font-bold leading-[1.35] tracking-[-0.01em]">@Title</div>
+                @if (ShowClose)
+                {
+                    <span @onclick="Cancel" title="Close"
+                          class="-mr-2 -mt-1 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-[13px] text-muted hover:bg-elevate hover:text-fg">✕</span>
+                }
+            </div>
+            @if (Detail is { Length: > 0 })
+            {
+                <div class="mt-2 break-words text-[13px] leading-[1.6] text-muted">@Detail</div>
+            }
+            @if (Error is { Length: > 0 })
+            {
+                <div class="anim-drop-in mt-3.5 rounded-md border border-playhead/30 bg-playhead/10 px-3 py-2 text-[12px] leading-[1.5] text-soft">@Error</div>
+            }
+        </div>
+        @* Footer well, so the actions read as a decision bar rather than two
+           links floating under the text. *@
+        <div class="flex items-center justify-end gap-2 rounded-b-[10px] border-t border-line bg-card px-6 py-3.5">
+            @if (SecondaryLabel is { Length: > 0 })
+            {
+                <div @onclick="OnSecondary"
+                     class="flex h-[34px] cursor-pointer items-center rounded-md border border-line2 px-4 text-[13px] font-semibold text-soft hover:border-[#4A4638] hover:bg-elevate hover:text-fg @Gate">@SecondaryLabel</div>
+            }
+            <div @onclick="OnConfirm"
+                 class="flex h-[34px] cursor-pointer items-center rounded-md px-5 text-[13px] font-bold active:scale-[0.98] @(Danger ? "bg-playhead text-ink hover:bg-[#F3714F]" : "bg-accent text-ink hover:bg-accent-soft") @Gate">
+                @(Busy ? BusyLabel : ConfirmLabel)
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter, EditorRequired] public string Title { get; set; } = "";
+    [Parameter] public string? Detail { get; set; }
+    [Parameter] public string? Error { get; set; }
+    [Parameter] public string ConfirmLabel { get; set; } = "Confirm";
+    [Parameter] public string BusyLabel { get; set; } = "Working…";
+    [Parameter] public string? SecondaryLabel { get; set; }
+
+    /// <summary>Dialogs with an explicit Cancel don't need a ✕ too.</summary>
+    [Parameter] public bool ShowClose { get; set; } = true;
+    [Parameter] public bool Danger { get; set; }
+    [Parameter] public bool Busy { get; set; }
+    [Parameter] public EventCallback OnConfirm { get; set; }
+    [Parameter] public EventCallback OnSecondary { get; set; }
+    [Parameter] public EventCallback OnCancel { get; set; }
+
+    string Gate => Busy ? "pointer-events-none opacity-60" : "";
+
+    Task Cancel() => Busy ? Task.CompletedTask : OnCancel.InvokeAsync();
+}

@@ -84,19 +84,25 @@ public static class CaptionRasterizer
             if (style == "karaoke" && words is { Count: > 0 })
             {
                 // Single-line sweep: draw word by word, measuring cumulative
-                // offsets. (Karaoke lines are short by construction.)
+                // offsets. Per-word layout can't wrap, so an over-long line is
+                // shrunk to fit rather than running off both edges.
                 var line = string.Join(' ', words);
                 var lineWidth = TextMeasurer.MeasureAdvance(line, new TextOptions(font)).Width;
+                var wordFont = lineWidth > maxWidth
+                    ? Family.Value.CreateFont(font.Size * maxWidth / lineWidth, FontStyle.Bold)
+                    : font;
+                if (lineWidth > maxWidth)
+                    lineWidth = TextMeasurer.MeasureAdvance(line, new TextOptions(wordFont)).Width;
                 var x = videoWidth / 2f - lineWidth / 2f;
                 for (var i = 0; i < words.Count; i++)
                 {
                     var wordText = words[i];
                     var colour = i < highlightWords ? Accent : SoftGrey;
-                    context.DrawText(new RichTextOptions(font)
+                    context.DrawText(new RichTextOptions(wordFont)
                     {
                         Origin = new SixLabors.ImageSharp.PointF(x, padY),
                     }, wordText, colour);
-                    x += TextMeasurer.MeasureAdvance(wordText + " ", new TextOptions(font)).Width;
+                    x += TextMeasurer.MeasureAdvance(wordText + " ", new TextOptions(wordFont)).Width;
                 }
             }
             else

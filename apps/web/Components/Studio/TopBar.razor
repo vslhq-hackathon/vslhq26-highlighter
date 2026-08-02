@@ -19,7 +19,7 @@
             <div class="flex w-[260px] items-center gap-2 rounded-md border border-line2 bg-ink px-[11px]">
                 <span class="text-xs text-faint">⌕</span>
                 <input @bind="S.Search" @bind:event="oninput" @bind:after="S.QueueSearch"
-                       placeholder="Search projects, highlights…" class="flex-1 border-none bg-transparent py-[7px] font-sans text-[12.5px] text-fg outline-none" />
+                       placeholder="@(S.IsProject ? "Search this project…" : "Search projects, highlights…")" class="flex-1 border-none bg-transparent py-[7px] font-sans text-[12.5px] text-fg outline-none" />
                 @if (S.Search.Trim().Length > 0)
                 {
                     <span @onclick="ClearSearch" class="cursor-pointer text-[11px] text-faint hover:text-fg">✕</span>
@@ -32,7 +32,7 @@
                     {
                         <div @onclick="() => S.OpenHit(hit)" class="flex cursor-pointer items-center gap-2 rounded px-2.5 py-[7px] hover:bg-well">
                             <span class="shrink-0 rounded-[3px] border border-line2 px-[5px] py-px font-mono text-[9px] uppercase @KindColor(hit.Kind)">@KindLabel(hit.Kind)</span>
-                            <span class="min-w-0 flex-1 truncate text-[12px] text-soft">@hit.Title</span>
+                            <span class="min-w-0 flex-1 break-words text-[12px] text-soft">@Fmt.Title(hit.Title)</span>
                             @if (hit.Kind != "project")
                             {
                                 <span class="max-w-[80px] shrink-0 truncate text-[10px] text-faint">@hit.ProjectName</span>

@@ -14,11 +14,15 @@ public static class EditorDocs
 
     public static readonly string[] CaptionStyles = ["boxed", "plain", "karaoke"];
 
+    /// <summary>"source" keeps the media's own geometry (what every document
+    /// did before formats existed); the rest are fixed delivery sizes.</summary>
+    public static readonly string[] Formats = ["source", "vertical", "square", "wide"];
+
     /// <summary>cutStart/cutEnd place the seeded segment inside a padded
     /// editing master (handle material outside the cut stays off the timeline
     /// until the user extends into it); the defaults cover the whole source.</summary>
     public static EditorDoc Default(double sourceDuration, IReadOnlyList<EdlCaption> captions,
-        double cutStart = 0, double? cutEnd = null)
+        double cutStart = 0, double? cutEnd = null, string format = "source")
     {
         var start = Math.Max(0, cutStart);
         var end = Math.Max(start + 0.04, cutEnd ?? Math.Max(0.04, sourceDuration));
@@ -30,7 +34,9 @@ public static class EditorDocs
             Markers: [],
             Transform: new EdlTransform(),
             Audio: new EdlAudio(),
-            Reframe: "auto");
+            Reframe: "auto",
+            Format: format,
+            CaptionsEnabled: true);
     }
 
     /// <summary>Shift every timing in the document by a constant offset — used
@@ -109,6 +115,31 @@ public static class EditorDocs
         return captions;
     }
 
+    /// <summary>Move a seeded caption list onto a later stretch of the timeline
+    /// and renumber its ids. SeedCaptions re-bases every window to t=0 and
+    /// restarts ids at c1, so stitching several windows together needs both.</summary>
+    public static List<EdlCaption> OffsetCaptions(
+        IEnumerable<EdlCaption> captions, double offset, int startIndex)
+    {
+        var shifted = new List<EdlCaption>();
+        var index = startIndex;
+        foreach (var caption in captions)
+        {
+            shifted.Add(caption with
+            {
+                Id = $"c{index++}",
+                Start = Math.Round(caption.Start + offset, 3),
+                End = Math.Round(caption.End + offset, 3),
+                Words = caption.Words?.Select(word => word with
+                {
+                    S = Math.Round(word.S + offset, 3),
+                    E = Math.Round(word.E + offset, 3),
+                }).ToList(),
+            });
+        }
+        return shifted;
+    }
+
     /// <summary>Fill in every optional/absent piece of a deserialized document —
     /// a JSON body (or an older persisted doc) can legally omit whole sections,
     /// and positional records deserialize those to null.</summary>
@@ -122,6 +153,10 @@ public static class EditorDocs
         Transform = doc.Transform ?? new EdlTransform(),
         Audio = doc.Audio ?? new EdlAudio(),
         Reframe = string.IsNullOrEmpty(doc.Reframe) ? "auto" : doc.Reframe,
+        // "source" is the pre-format behavior, so old documents keep exporting
+        // at their media's own geometry.
+        Format = string.IsNullOrEmpty(doc.Format) ? "source" : doc.Format,
+        CaptionsEnabled = doc.CaptionsEnabled ?? true,
     };
 
     /// <summary>Null when valid, else a caller-facing error message. Collection
@@ -151,6 +186,8 @@ public static class EditorDocs
             return "captionStyle must be boxed, plain or karaoke";
         if (doc.Reframe is not ("auto" or "manual"))
             return "reframe must be auto or manual";
+        if (doc.Format is not { } format || !Formats.Contains(format))
+            return "format must be source, vertical, square or wide";
         if (doc.Transform.Scale is < 1.0 or > 3.0) return "transform.scale must be 1..3";
         if (doc.Transform.PosX is < -1.0 or > 1.0) return "transform.posX must be -1..1";
         if (doc.Audio.Voice is < 0 or > 2) return "audio.voice must be 0..2";

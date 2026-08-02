@@ -41,12 +41,34 @@ public static class Fmt
     /// <summary>Pipeline clip scores are 0..1 doubles; the UI shows 0–100.</summary>
     public static int Score100(double? score) => (int)Math.Round((score ?? 0) * 100);
 
-    /// <summary>SampleData's exact opacity ramp, kept for visual continuity.</summary>
+    /// <summary>Score badge opacity: a 50 barely shows, a 100 is solid.</summary>
     public static string ScoreOpacity(double? score) =>
         (0.35 + 0.65 * Math.Max(0, (Score100(score) - 50) / 50.0))
             .ToString("0.00", CultureInfo.InvariantCulture);
 
-    public static string Kind(string sourceType) => sourceType.ToUpperInvariant();
+    /// <summary>projects.source_type in the language editors use: a platform
+    /// video is a VOD, not just a "video".</summary>
+    public static string Kind(string sourceType) => sourceType switch
+    {
+        "video" => "VOD",
+        "livestream" => "LIVESTREAM",
+        "upload" => "UPLOAD",
+        _ => sourceType.ToUpperInvariant(),
+    };
+
+    /// <summary>Titles wrap onto as many lines as they need, so a trailing
+    /// ellipsis — whether the model wrote one into the title or the 140-char
+    /// source-name cap added it — only ever reads as a broken string.</summary>
+    public static string Title(string? raw)
+    {
+        var text = (raw ?? "").Trim();
+        while (true)
+        {
+            if (text.EndsWith('…')) text = text[..^1].TrimEnd();
+            else if (text.EndsWith("...")) text = text[..^3].TrimEnd();
+            else return text;
+        }
+    }
 
     public static string Outputs(string pipeline) => pipeline switch
     {
@@ -58,13 +80,27 @@ public static class Fmt
     public static string StatusLine(ProjectSummaryDto p) => p.Status switch
     {
         "created" => "Queued",
-        "ingesting" => p.Progress.Percent is { } pct ? $"Editing · {pct * 100:0}%" : "Editing",
+        "ingesting" => IngestLine(p),
         "stopping" => "Stopping",
         "ready" => "Ready",
         "failed" => "Failed",
         "cancelled" => "Cancelled",
         var s when s.Length > 0 => char.ToUpperInvariant(s[0]) + s[1..],
         _ => "",
+    };
+
+    /// <summary>What the run is actually doing. Only the capture phase has a
+    /// meaningful fraction (transcript chunks stored); the finishing phases are
+    /// single long steps, so they get named instead of a number that would sit
+    /// at 99% for minutes.</summary>
+    private static string IngestLine(ProjectSummaryDto p) => p.Progress.Stage switch
+    {
+        "finishing" => "Scoring highlights",
+        "editing" => "Editing the cut",
+        "stitching" => "Stitching the cut",
+        "thumbnails" => "Generating thumbnails",
+        "uploading" => "Uploading",
+        _ => p.Progress.Percent is { } pct ? $"Transcribing · {pct * 100:0}%" : "Transcribing",
     };
 
     public static string Added(DateTimeOffset createdAt) =>

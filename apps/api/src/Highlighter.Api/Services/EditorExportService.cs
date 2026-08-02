@@ -214,13 +214,18 @@ public sealed class EditorExportService(
         // overlays are rasterized to PNGs (ImageSharp) and composited with the
         // overlay filter. ffmpeg runs inside the work dir so every input in the
         // graph is a bare relative filename.
+        // Overlays composite onto the FORMATTED frame, so they must be sized
+        // against the delivered dimensions — not the source's.
+        var (outWidth, outHeight) = EditorRenderer.OutputDims(doc, info);
+        if (outWidth != info.Width || outHeight != info.Height)
+            job.Append("api", $"format {doc.Format}: delivering {outWidth}x{outHeight}");
         var plan = EditorRenderer.PlanOverlays(doc);
         foreach (var item in plan)
         {
             var png = item.Kind == "text"
-                ? CaptionRasterizer.RenderTextOverlay(item.Text, info.Width, info.Height)
+                ? CaptionRasterizer.RenderTextOverlay(item.Text, outWidth, outHeight)
                 : CaptionRasterizer.RenderCaption(item.Text, doc.CaptionStyle,
-                    info.Width, info.Height, item.Words, item.HighlightWords);
+                    outWidth, outHeight, item.Words, item.HighlightWords);
             await File.WriteAllBytesAsync(Path.Combine(work, item.FileName), png, ct);
         }
         if (plan.Count > 0)

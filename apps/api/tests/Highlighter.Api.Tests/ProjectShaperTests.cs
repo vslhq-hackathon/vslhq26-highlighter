@@ -42,18 +42,59 @@ public class ProjectShaperTests
         Assert.True(dto.Processing);
         Assert.Equal("ingesting", dto.Progress.Stage);
         Assert.Equal(20, dto.Progress.ChunksExpected);
-        Assert.Equal(0.35, dto.Progress.Percent!.Value, precision: 5);
+        // Capture owns the first 72% of the bar; the finishing phases hold the
+        // rest, so 7/20 chunks reads 25.2%, not 35%.
+        Assert.Equal(0.252, dto.Progress.Percent!.Value, precision: 5);
         Assert.Equal(0.5, dto.MinClipScore);
     }
 
     [Fact]
-    public void Progress_MaxChunksCapsExpectedAndPercentTopsOutAtOne()
+    public void Progress_MaxChunksCapsExpectedAndCaptureTopsOutAtItsShare()
     {
         var progress = ProjectShaper.BuildProgress(
             "ingesting", chunksStored: 3, sourceMinutes: 30, chunkSeconds: 90, maxChunks: 2);
 
         Assert.Equal(2, progress.ChunksExpected);
-        Assert.Equal(1.0, progress.Percent);
+        Assert.Equal(0.72, progress.Percent!.Value, precision: 5);
+    }
+
+    [Theory]
+    [InlineData("finishing", 0.75)]
+    [InlineData("editing", 0.80)]
+    [InlineData("stitching", 0.86)]
+    [InlineData("thumbnails", 0.90)]
+    [InlineData("uploading", 0.96)]
+    public void Progress_TailStagesAdvancePastCapture(string stage, double expected)
+    {
+        // The finishing tail has no fraction to report — every phase after
+        // capture used to sit at "99%" for minutes.
+        var progress = ProjectShaper.BuildProgress(
+            "ingesting", chunksStored: 20, sourceMinutes: 30, chunkSeconds: 90, maxChunks: 0,
+            workerStage: stage);
+
+        Assert.Equal(stage, progress.Stage);
+        Assert.Equal(expected, progress.Percent!.Value, precision: 5);
+    }
+
+    [Fact]
+    public void Progress_UnknownStageFallsBackToTheCaptureFraction()
+    {
+        // A worker older than the stage markers (or a newer one than this API).
+        var progress = ProjectShaper.BuildProgress(
+            "ingesting", chunksStored: 10, sourceMinutes: 30, chunkSeconds: 90, maxChunks: 0,
+            workerStage: "polishing");
+
+        Assert.Equal(0.36, progress.Percent!.Value, precision: 5);
+    }
+
+    [Fact]
+    public void Progress_LivestreamTailIsDeterminateEvenWithoutAProbe()
+    {
+        var progress = ProjectShaper.BuildProgress(
+            "ingesting", chunksStored: 40, sourceMinutes: null, chunkSeconds: 90, maxChunks: 0,
+            workerStage: "stitching");
+
+        Assert.Equal(0.86, progress.Percent!.Value, precision: 5);
     }
 
     [Fact]

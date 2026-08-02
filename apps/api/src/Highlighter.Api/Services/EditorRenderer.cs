@@ -77,6 +77,19 @@ public sealed class EditorRenderer(ILogger<EditorRenderer> log)
     /// seconds, at YExpr (an ffmpeg expression over main_h/overlay_h).</summary>
     public sealed record OverlaySpec(string FileName, double Start, double End, string YExpr);
 
+    /// <summary>The delivered frame size. "source" keeps the media's own
+    /// geometry (the only behavior documents had before formats existed); the
+    /// named formats are the platform delivery sizes the editor's chip
+    /// advertises.</summary>
+    public static (int Width, int Height) OutputDims(EditorDoc doc, SourceInfo source) =>
+        doc.Format switch
+        {
+            "vertical" => (1080, 1920),
+            "square" => (1080, 1080),
+            "wide" => (1920, 1080),
+            _ => (source.Width, source.Height),
+        };
+
     /// <summary>The full -filter_complex expression. Inputs: 0 = source,
     /// 1 = music pad (only when doc.Audio.Music > 0), then one input per
     /// overlay PNG starting at overlayInputBase.</summary>
@@ -103,18 +116,48 @@ public sealed class EditorRenderer(ILogger<EditorRenderer> log)
         chains.Add($"{concatInputs}concat=n={doc.Segments.Count}:v=1:a={(source.HasAudio ? 1 : 0)}"
             + $"[vcat]{(source.HasAudio ? "[acat]" : "")}");
 
-        // Video finishing chain: reframe zoom/pan, then overlay compositing.
-        var videoOps = new List<string>();
-        if (doc.Reframe == "manual" && doc.Transform.Scale > 1.001)
+        // Video finishing chain: format/reframe, then overlay compositing.
+        var (outWidth, outHeight) = OutputDims(doc, source);
+        var targeted = doc.Format is "vertical" or "square" or "wide";
+        var pan = Math.Clamp(0.5 + doc.Transform.PosX / 2.0, 0, 1);
+        if (targeted && doc.Reframe != "manual")
         {
-            var scale = doc.Transform.Scale;
-            var xFraction = Math.Clamp(0.5 + doc.Transform.PosX / 2.0, 0, 1);
-            videoOps.Add($"crop=w=iw/{F(scale)}:h=ih/{F(scale)}"
-                + $":x=(iw-iw/{F(scale)})*{F(xFraction)}:y=(ih-ih/{F(scale)})/2");
-            videoOps.Add($"scale={source.Width}:{source.Height}");
+            // Auto: fit the whole frame inside the target, fill the margins with
+            // a blurred dimmed copy of it. Nothing is cropped away, and it
+            // matches the look the pipeline's own vertical renders ship with.
+            chains.Add("[vcat]split=2[vbg][vfg]");
+            chains.Add($"[vbg]scale={outWidth}:{outHeight}:force_original_aspect_ratio=increase"
+                + $",crop={outWidth}:{outHeight},setsar=1,gblur=sigma=28,eq=brightness=-0.06[vbgb]");
+            chains.Add($"[vfg]scale={outWidth}:{outHeight}"
+                + ":force_original_aspect_ratio=decrease,setsar=1[vfgs]");
+            chains.Add("[vbgb][vfgs]overlay=x=(main_w-overlay_w)/2:y=(main_h-overlay_h)/2[vbase]");
+        }
+        else
+        {
+            var videoOps = new List<string>();
+            if (targeted)
+            {
+                // Manual: crop the largest target-aspect window that fits,
+                // shrunk by zoom and slid horizontally by posX. At scale 1 this
+                // is a plain aspect crop, so panning works without zooming in.
+                var scale = Math.Max(1.0, doc.Transform.Scale);
+                var cropW = $"min(iw\\,ih*{outWidth}/{outHeight})/{F(scale)}";
+                var cropH = $"min(ih\\,iw*{outHeight}/{outWidth})/{F(scale)}";
+                videoOps.Add($"crop=w={cropW}:h={cropH}"
+                    + $":x=(iw-({cropW}))*{F(pan)}:y=(ih-({cropH}))/2");
+                videoOps.Add($"scale={outWidth}:{outHeight}");
+                videoOps.Add("setsar=1");
+            }
+            else if (doc.Reframe == "manual" && doc.Transform.Scale > 1.001)
+            {
+                var scale = doc.Transform.Scale;
+                videoOps.Add($"crop=w=iw/{F(scale)}:h=ih/{F(scale)}"
+                    + $":x=(iw-iw/{F(scale)})*{F(pan)}:y=(ih-ih/{F(scale)})/2");
+                videoOps.Add($"scale={source.Width}:{source.Height}");
+            }
+            chains.Add($"[vcat]{string.Join(",", videoOps.Count > 0 ? videoOps : ["null"])}[vbase]");
         }
         var current = "[vbase]";
-        chains.Add($"[vcat]{string.Join(",", videoOps.Count > 0 ? videoOps : ["null"])}{current}");
         for (var i = 0; i < overlays.Count; i++)
         {
             var spec = overlays[i];
@@ -183,16 +226,17 @@ public sealed class EditorRenderer(ILogger<EditorRenderer> log)
     public static List<OverlayPlanItem> PlanOverlays(EditorDoc doc, int maxInputs = 240)
     {
         var items = new List<OverlayPlanItem>();
+        IReadOnlyList<EdlCaption> captions = doc.CaptionsEnabled == false ? [] : doc.Captions;
         var karaoke = doc.CaptionStyle == "karaoke";
         if (karaoke)
         {
-            var stateCount = doc.Captions.Sum(caption => Math.Max(1, caption.Words?.Count ?? 1))
+            var stateCount = captions.Sum(caption => Math.Max(1, caption.Words?.Count ?? 1))
                 + doc.Texts.Count;
             if (stateCount > maxInputs) karaoke = false; // degrade: line-level accent
         }
 
         var index = 0;
-        foreach (var caption in doc.Captions)
+        foreach (var caption in captions)
         {
             if (string.IsNullOrWhiteSpace(caption.Text)) continue;
             var line = EditorDocs.MapWindow(doc, caption.Start, caption.End);

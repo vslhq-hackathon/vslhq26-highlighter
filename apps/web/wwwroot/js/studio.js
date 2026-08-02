@@ -6,6 +6,13 @@ export function setPlaying(video, playing) {
   if (!video) return;
   clearReverse(video);
   if (playing) {
+    // Reaching the end parks the playhead on the last frame (see onTime), so
+    // pressing play there means "replay" — rewind first.
+    const state = watchers.get(video);
+    const lastEnd = state?.segments?.[state.segments.length - 1]?.end;
+    if (Number.isFinite(lastEnd) && video.currentTime >= lastEnd - 0.1) {
+      video.currentTime = state.segments[0]?.start ?? 0;
+    }
     // Autoplay policy can reject play() outside a user gesture; the UI stays
     // truthful via the element's own play/pause events.
     video.play().catch(() => {});
@@ -81,15 +88,14 @@ export function watch(video, dotnet, segments) {
           // Paused scrub/step into a cut: settle at the next region's start
           // without changing play state.
           video.currentTime = next.start;
-        } else if (wasPaused || state.reverseTimer) {
-          // Paused past the end (scrub, frame-step): clamp to the end of the
-          // cut instead of yanking the playhead back to the top.
-          const lastEnd = state.segments[state.segments.length - 1]?.end ?? 0;
-          video.currentTime = Math.max(0, lastEnd - 0.05);
         } else {
-          // Natural end of playback: stop and rewind, ready to replay.
-          video.pause();
-          video.currentTime = state.segments[0]?.start ?? 0;
+          // Past the end — whether scrubbed there, stepped there, or played
+          // there. Park on the last frame; rewinding here is what made every
+          // skip-to-end button look like it "jumped the video to the front".
+          // setPlaying() rewinds when the user actually asks to replay.
+          const lastEnd = state.segments[state.segments.length - 1]?.end ?? 0;
+          if (!video.paused) video.pause();
+          video.currentTime = Math.max(0, lastEnd - 0.05);
         }
         return;
       }
@@ -157,6 +163,206 @@ export function unwatch(video) {
     video.removeEventListener('seeked', state.syncHandler);
     video.removeEventListener('pause', state.syncHandler);
     watchers.delete(video);
+  }
+  clearCaptions(video);
+  setMusicBed(video, 0);
+}
+
+// Captions render here, not in Blazor: the karaoke sweep has to compare each
+// word against video.currentTime every frame, and the playhead Blazor sees is
+// a 0.2s-throttled SignalR round-trip away. Blazor pushes the caption list;
+// this file owns the per-frame paint.
+const captionStates = new WeakMap();
+
+export function setCaptions(video, layer, captions, style, enabled) {
+  if (!video || !layer) return;
+  let state = captionStates.get(video);
+  if (!state) {
+    state = { raf: 0, activeId: null, activeStyle: null, words: [] };
+    state.onPlay = () => startCaptions(video, state);
+    state.onPause = () => { stopCaptions(state); paintCaption(video, state); };
+    // rAF gives the smooth per-frame sweep, but it is frozen in a hidden tab
+    // while the media keeps playing. timeupdate still fires (~4Hz), so it
+    // doubles as both the paused-scrub paint and a coarse playing fallback.
+    state.onSync = () => paintCaption(video, state);
+    video.addEventListener('play', state.onPlay);
+    video.addEventListener('pause', state.onPause);
+    video.addEventListener('seeked', state.onSync);
+    video.addEventListener('timeupdate', state.onSync);
+    captionStates.set(video, state);
+  }
+  state.layer = layer;
+  state.captions = captions ?? [];
+  state.style = style || 'boxed';
+  state.enabled = enabled !== false;
+  state.activeId = null; // force a rebuild against the new list
+  paintCaption(video, state);
+  if (!video.paused) startCaptions(video, state);
+}
+
+function clearCaptions(video) {
+  const state = video && captionStates.get(video);
+  if (!state) return;
+  stopCaptions(state);
+  video.removeEventListener('play', state.onPlay);
+  video.removeEventListener('pause', state.onPause);
+  video.removeEventListener('seeked', state.onSync);
+  video.removeEventListener('timeupdate', state.onSync);
+  state.layer?.replaceChildren();
+  captionStates.delete(video);
+}
+
+function startCaptions(video, state) {
+  if (state.raf) return;
+  const tick = () => {
+    state.raf = requestAnimationFrame(tick);
+    paintCaption(video, state);
+  };
+  state.raf = requestAnimationFrame(tick);
+}
+
+function stopCaptions(state) {
+  if (state.raf) cancelAnimationFrame(state.raf);
+  state.raf = 0;
+}
+
+function paintCaption(video, state) {
+  const layer = state.layer;
+  if (!layer) return;
+  const t = video.currentTime;
+  const active = state.enabled
+    ? state.captions.find(c => t >= c.start && t <= c.end)
+    : null;
+  if (!active) {
+    // Keyed off the DOM, not activeId: setCaptions nulls activeId to force a
+    // rebuild, which would otherwise make this skip clearing a stale line.
+    if (layer.firstChild) {
+      layer.replaceChildren();
+      state.words = [];
+    }
+    state.activeId = null;
+    return;
+  }
+  if (state.activeId !== active.id || state.activeStyle !== state.style) {
+    state.activeId = active.id;
+    state.activeStyle = state.style;
+    layer.replaceChildren(buildCaption(active, state.style, state));
+  }
+  for (const word of state.words) {
+    const on = word.at <= t;
+    if (word.on !== on) {
+      word.on = on;
+      word.el.classList.toggle('cap-word-on', on);
+    }
+  }
+}
+
+function buildCaption(caption, style, state) {
+  const line = document.createElement('span');
+  line.className = `cap-line cap-${style}`;
+  state.words = [];
+  const words = caption.words ?? [];
+  if (style === 'karaoke' && words.length > 0) {
+    for (const word of words) {
+      const el = document.createElement('span');
+      el.className = 'cap-word';
+      el.textContent = `${word.t} `; // textContent, never innerHTML — caption text is user data
+      line.appendChild(el);
+      state.words.push({ el, at: word.s, on: false });
+    }
+  } else {
+    line.textContent = caption.text;
+  }
+  return line;
+}
+
+// Music bed preview. The export mixes a synthesized pad (three sines + tremolo
+// + lowpass); this mirrors it with WebAudio so the slider is audible before
+// export. Pure synthesis — no createMediaElementSource, so a cross-origin
+// media response can never silence the program monitor.
+let audioCtx = null;
+const musicBeds = new WeakMap();
+
+export function setMusicBed(video, level) {
+  if (!video) return;
+  const wanted = Math.max(0, Math.min(1, level || 0));
+  let bed = musicBeds.get(video);
+  if (wanted <= 0.001) {
+    if (bed) teardownBed(video, bed);
+    return;
+  }
+  bed ??= createBed(video);
+  if (!bed) return;
+  bed.level = wanted;
+  applyBedGain(bed, video.paused ? 0 : wanted);
+}
+
+function createBed(video) {
+  try {
+    audioCtx ??= new (window.AudioContext || window.webkitAudioContext)();
+  } catch {
+    return null; // no WebAudio: the bed is preview-only, export is unaffected
+  }
+  const master = audioCtx.createGain();
+  master.gain.value = 0;
+  master.connect(audioCtx.destination);
+  const lowpass = audioCtx.createBiquadFilter();
+  lowpass.type = 'lowpass';
+  lowpass.frequency.value = 1200;
+  lowpass.connect(master);
+  const oscillators = [196, 294, 392].map(frequency => {
+    const oscillator = audioCtx.createOscillator();
+    oscillator.type = 'sine';
+    oscillator.frequency.value = frequency;
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.33;
+    oscillator.connect(gain).connect(lowpass);
+    oscillator.start();
+    return oscillator;
+  });
+  const bed = { master, oscillators, level: 0 };
+  bed.onPlay = () => {
+    audioCtx.resume?.().catch(() => {});
+    applyBedGain(bed, bed.level);
+  };
+  bed.onPause = () => applyBedGain(bed, 0);
+  video.addEventListener('play', bed.onPlay);
+  video.addEventListener('pause', bed.onPause);
+  video.addEventListener('ended', bed.onPause);
+  musicBeds.set(video, bed);
+  return bed;
+}
+
+function applyBedGain(bed, level) {
+  // 0.25 keeps the pad under the voice, matching the export's music*0.5 into
+  // an amix that halves both legs.
+  const now = audioCtx.currentTime;
+  bed.master.gain.cancelScheduledValues(now);
+  bed.master.gain.setTargetAtTime(level * 0.25, now, 0.08);
+}
+
+function teardownBed(video, bed) {
+  video.removeEventListener('play', bed.onPlay);
+  video.removeEventListener('pause', bed.onPause);
+  video.removeEventListener('ended', bed.onPause);
+  for (const oscillator of bed.oscillators) {
+    try { oscillator.stop(); } catch { /* already stopped */ }
+  }
+  try { bed.master.disconnect(); } catch { /* already detached */ }
+  musicBeds.delete(video);
+}
+
+// Unsaved-changes guard. Autosave debounces 1.5s, so a tab closed right after
+// an edit would lose it silently.
+let dirtyGuard = null;
+
+export function setDirtyGuard(dirty) {
+  if (dirty && !dirtyGuard) {
+    dirtyGuard = event => { event.preventDefault(); event.returnValue = ''; };
+    window.addEventListener('beforeunload', dirtyGuard);
+  } else if (!dirty && dirtyGuard) {
+    window.removeEventListener('beforeunload', dirtyGuard);
+    dirtyGuard = null;
   }
 }
 

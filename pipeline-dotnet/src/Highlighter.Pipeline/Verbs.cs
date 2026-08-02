@@ -81,7 +81,9 @@ public static class Verbs
                     && JsonUtil.Truthy(v["url"]));
             if (chosen is null)
                 throw new PipelineError($"No hosted thumbnail #{selectIndex} on record");
-            thumbnails["selected_index"] = variants.IndexOf(chosen);
+            // Store the variant's own number: list positions move when a
+            // variant fails or one is imported.
+            thumbnails["selected_index"] = selectIndex;
             render["thumbnails"] = thumbnails;
             PersistRender(db, records, row, rowVersion, metadata, render, JsonUtil.Str(chosen["url"]));
             Console.WriteLine($"Selected thumbnail #{selectIndex} for version {rowVersion}");
@@ -116,7 +118,7 @@ public static class Verbs
         var bucket = Config.Env("SUPABASE_CLIPS_BUCKET", Defaults.DEFAULT_SUPABASE_CLIPS_BUCKET)!;
         foreach (var variant in (result["variants"] as JsonArray ?? new JsonArray()).OfType<JsonObject>())
         {
-            if (db is null) continue;
+            if (db is null || !JsonUtil.Truthy(variant["local_path"])) continue;
             var localPath = JsonUtil.Str(variant["local_path"]);
             var key = $"projects/{projectId}/thumbnails/{Path.GetFileName(localPath)}";
             try
@@ -131,7 +133,12 @@ public static class Verbs
         }
 
         var merged = new JsonArray();
-        foreach (var variant in variants.OfType<JsonObject>().ToList()) merged.Add(JsonUtil.CloneObj(variant));
+        // A regenerate replaces the previous failures rather than stacking dead
+        // cards up in the picker.
+        foreach (var variant in variants.OfType<JsonObject>()
+            .Where(v => JsonUtil.Truthy(v["url"]) || !JsonUtil.Truthy(v["error"]))
+            .ToList())
+            merged.Add(JsonUtil.CloneObj(variant));
         foreach (var variant in (result["variants"] as JsonArray ?? new JsonArray()).OfType<JsonObject>().ToList())
             merged.Add(JsonUtil.CloneObj(variant));
         thumbnails["variants"] = merged;

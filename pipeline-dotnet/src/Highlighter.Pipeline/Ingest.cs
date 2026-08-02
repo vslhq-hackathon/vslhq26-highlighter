@@ -1224,6 +1224,9 @@ public static class Ingest
                     archiveDir: archiveDir,
                     onVideoSegment: archiveDir is not null ? HandleVideoSegment : null,
                     shouldStop: StopRequestedPoll);
+                // Capture is done; everything below is the finishing tail, which
+                // has no chunk fraction to report.
+                WriteProgressStage(db, projectId, "finishing");
                 // Every chunk must be transcribed and delivered before the
                 // coordinators can drain.
                 transcribePool.Finish();
@@ -1253,6 +1256,7 @@ public static class Ingest
 
                 if (longFork is not null && !stopRequested)
                 {
+                    WriteProgressStage(db, projectId, "editing");
                     var longform = EditLongform(
                         db: db,
                         records: records!,
@@ -1696,6 +1700,7 @@ public static class Ingest
             $"Stitching {ordered.Count} segment(s) (~{Py.F(totalSeconds / 60, 1)} min) "
             + $"into {outputPath}");
 
+        WriteProgressStage(db, projectId, "stitching");
         try
         {
             Stitch.StitchClips(
@@ -1753,6 +1758,7 @@ public static class Ingest
         JsonObject? thumbnails = null;
         if (thumbnailsEnabled)
         {
+            WriteProgressStage(db, projectId, "thumbnails");
             try
             {
                 thumbnails = Thumbnails.GenerateThumbnails(
@@ -1772,6 +1778,7 @@ public static class Ingest
 
         if (db is not null)
         {
+            WriteProgressStage(db, projectId, "uploading");
             try
             {
                 var storageKey = $"projects/{projectId}/longform/{Path.GetFileName(outputPath)}";
@@ -1800,6 +1807,9 @@ public static class Ingest
                     foreach (var variantNode in thumbnails["variants"] as JsonArray ?? new JsonArray())
                     {
                         if (variantNode is not JsonObject variant) continue;
+                        // Failed variants are recorded for the UI but have no
+                        // file to upload.
+                        if (!JsonUtil.Truthy(variant["local_path"])) continue;
                         try
                         {
                             var variantPath = JsonUtil.Str(variant["local_path"]);
@@ -1860,19 +1870,45 @@ public static class Ingest
         return result;
     }
 
+    /// <summary>Record which finishing phase the run is in, so the UI can stop
+    /// reporting "99%" for the minutes between the last transcript chunk and
+    /// the ready status. Best-effort: a run must never fail over a progress
+    /// marker.</summary>
+    private static void WriteProgressStage(SupabaseClient? db, string projectId, string stage)
+    {
+        if (db is null) return;
+        try
+        {
+            var metadata = db.GetProject(projectId)["metadata"] as JsonObject ?? new JsonObject();
+            metadata["progress"] = new JsonObject { ["stage"] = stage };
+            db.UpdateProjectMetadata(projectId, metadata);
+        }
+        catch (Exception exc)
+        {
+            Console.WriteLine($"Could not record progress stage '{stage}' (non-fatal): {exc.Message}");
+        }
+    }
+
     /// <summary>The thumbnail a longform_edits row shows: the selected generated
     /// variant when one was uploaded, else the midpoint frame.</summary>
     private static string? DisplayThumbnailUrl(JsonObject result)
     {
+        // selected_index is the variant's stable number, so a failed or
+        // imported variant shifting the list can't change which image shows.
         if (result["thumbnails"] is JsonObject thumbnails
             && thumbnails["variants"] is JsonArray variants
-            && JsonUtil.TryDouble(thumbnails["selected_index"], out var selectedIndex)
-            && (int)selectedIndex >= 0
-            && (int)selectedIndex < variants.Count
-            && variants[(int)selectedIndex] is JsonObject selected
-            && JsonUtil.Truthy(selected["url"]))
+            && JsonUtil.TryDouble(thumbnails["selected_index"], out var selectedIndex))
         {
-            return JsonUtil.Str(selected["url"]);
+            foreach (var node in variants)
+            {
+                if (node is not JsonObject variant) continue;
+                if (JsonUtil.TryDouble(variant["index"], out var index)
+                    && (int)index == (int)selectedIndex
+                    && JsonUtil.Truthy(variant["url"]))
+                {
+                    return JsonUtil.Str(variant["url"]);
+                }
+            }
         }
         return JsonUtil.StrOrNull(result["thumbnail_url"]);
     }

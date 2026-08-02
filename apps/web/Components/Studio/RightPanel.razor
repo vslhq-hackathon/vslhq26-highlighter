@@ -27,18 +27,28 @@
                 · <span class="@(S.Edit.SaveState == "Save failed" ? "text-playhead" : "text-faint")">@S.Edit.SaveState.ToUpperInvariant()</span>
             </div>
 
+            <div class="pb-1.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">SELECTION</div>
+            @* Every selectable block on the timeline gets its editor here —
+               clicking a caption or a marker used to land on the "select
+               something" hint, which is what nothing-happens looks like. *@
             @if (S.Edit.SelectedSegment is { } segment)
             {
                 <Slider Label="Segment speed" Value="@segment.Speed" Min="0.5" Max="2" Step="0.05"
                         Display="@($"{segment.Speed:0.##}×")"
                         OnChange="v => S.Edit.SetSegmentSpeed(segment.Id, v)" />
             }
-            else
+            else if (S.Edit.SelectedCaption is { } caption)
             {
-                <div class="pb-4 text-[10.5px] leading-[1.5] text-faint">Select a segment on the timeline to adjust its speed.</div>
+                <div class="pb-4">
+                    <div class="mb-[7px] flex items-center justify-between text-xs">
+                        <span class="font-semibold text-soft">Caption</span>
+                        <span class="font-mono text-[9.5px] text-faint">@Fmt.Stamp(caption.Start)</span>
+                    </div>
+                    <input value="@caption.Text" @onchange='e => S.Edit.UpdateCaptionText(caption.Id, e.Value?.ToString() ?? "")'
+                           class="box-border w-full rounded-md border border-line3 bg-ink px-[10px] py-[7px] font-sans text-[12px] text-fg outline-none focus:border-[#4A4638]" />
+                </div>
             }
-
-            @if (S.Edit.SelectedText is { } text)
+            else if (S.Edit.SelectedText is { } text)
             {
                 <div class="pb-4">
                     <div class="mb-[7px] text-xs font-semibold text-soft">Text overlay</div>
@@ -48,6 +58,21 @@
                 <Slider Label="Text position" Value="@text.Y" Min="0.05" Max="0.9" Step="0.01"
                         Display="@($"{text.Y * 100:0}%")"
                         OnChange="v => S.Edit.UpdateTextOverlay(text.Id, y: v)" />
+            }
+            else if (S.Edit.SelectedMarker is { } marker)
+            {
+                <div class="pb-4">
+                    <div class="mb-[7px] flex items-center justify-between text-xs">
+                        <span class="font-semibold text-soft">Marker</span>
+                        <span class="font-mono text-[9.5px] text-faint">@Fmt.Stamp(marker.At)</span>
+                    </div>
+                    <input value="@marker.Label" @onchange='e => S.Edit.UpdateMarkerLabel(marker.Id, e.Value?.ToString() ?? "")'
+                           class="box-border w-full rounded-md border border-line3 bg-ink px-[10px] py-[7px] font-sans text-[12px] text-fg outline-none focus:border-[#4A4638]" />
+                </div>
+            }
+            else
+            {
+                <div class="pb-4 text-[10.5px] leading-[1.5] text-faint">Select a segment, caption, text or marker on the timeline.</div>
             }
 
             @if (S.ActiveClip is not null)
@@ -89,38 +114,69 @@
 
             @if (S.Edit.Doc is { } doc)
             {
-                <Slider Label="Zoom" Value="@doc.Transform.Scale" Min="1" Max="3" Step="0.05"
-                        Display="@($"{doc.Transform.Scale:0.##}×")" Disabled="@(doc.Reframe != "manual")"
-                        OnChange="v => S.Edit.SetTransform(scale: v)" />
-                <Slider Label="Position X" Value="@doc.Transform.PosX" Min="-1" Max="1" Step="0.05"
-                        Display="@($"{doc.Transform.PosX:+0.##;-0.##;0}")" Disabled="@(doc.Reframe != "manual")"
-                        OnChange="v => S.Edit.SetTransform(posX: v)" />
-                <Slider Label="Voice volume" Value="@doc.Audio.Voice" Min="0" Max="2" Step="0.05"
-                        Display="@($"{doc.Audio.Voice * 100:0}%")"
-                        OnChange="v => S.Edit.SetAudio(voice: v)" />
-                <Slider Label="Music bed" Value="@doc.Audio.Music" Min="0" Max="1" Step="0.05"
-                        Display="@(doc.Audio.Music > 0.001 ? $"{doc.Audio.Music * 100:0}%" : "off")"
-                        OnChange="v => S.Edit.SetAudio(music: v)" />
-                <div class="pb-1 text-[10px] leading-[1.5] text-faint">Music bed and final caption typography render on export; the preview approximates them.</div>
-            }
-
-            <div class="mt-2 flex flex-col gap-3 border-t border-line pt-3.5">
-                <div class="flex items-center justify-between text-xs">
-                    <span class="font-semibold text-soft">Format</span>
-                    <span class="flex overflow-hidden rounded border border-line2">
-                        @foreach (var (key, label) in new[] { ("auto", "Auto 9:16"), ("square", "1:1"), ("wide", "16:9") })
-                        {
-                            <span @onclick="() => S.SetClipFormat(key)" class="cursor-pointer px-[8px] py-[3px] @(key != "auto" ? "border-l border-line2" : "") @(S.ClipFormat == key ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">@label</span>
-                        }
-                    </span>
+                <div class="mt-2 border-t border-line pt-3.5">
+                    <div class="pb-2.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">FRAME</div>
+                    <div class="mb-3.5 flex flex-col gap-3">
+                        <div class="flex items-center justify-between text-xs">
+                            <span class="font-semibold text-soft">Format</span>
+                            @if (S.ActiveClip is null)
+                            {
+                                @* The long-form cut is the 16:9 deliverable. *@
+                                <span class="font-mono text-[10.5px] text-faint">16:9 · source</span>
+                            }
+                            else
+                            {
+                                <span class="flex overflow-hidden rounded border border-line2">
+                                    @foreach (var (key, label) in FormatOptions)
+                                    {
+                                        <span @onclick="() => S.Edit.SetFormat(key)" title="@label"
+                                              class="cursor-pointer px-[8px] py-[3px] @(key != FormatOptions[0].Key ? "border-l border-line2" : "") @(CurrentFormat == key ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">@label</span>
+                                    }
+                                </span>
+                            }
+                        </div>
+                        <div class="flex items-center justify-between text-xs">
+                            <span class="font-semibold text-soft">Reframe</span>
+                            <span class="flex overflow-hidden rounded border border-line2">
+                                <span @onclick='() => S.Edit.SetReframe("auto")' title="Auto"
+                                      class="cursor-pointer px-[9px] py-[3px] @(doc.Reframe != "manual" ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">Auto</span>
+                                <span @onclick='() => S.Edit.SetReframe("manual")' title="Manual"
+                                      class="cursor-pointer border-l border-line2 px-[9px] py-[3px] @(doc.Reframe == "manual" ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">Manual</span>
+                            </span>
+                        </div>
+                    </div>
+                    <Slider Label="Zoom" Value="@doc.Transform.Scale" Min="1" Max="3" Step="0.05"
+                            Display="@($"{doc.Transform.Scale:0.##}×")"
+                            OnChange="v => S.Edit.SetTransform(scale: v)" />
+                    <Slider Label="Position X" Value="@doc.Transform.PosX" Min="-1" Max="1" Step="0.05"
+                            Display="@($"{doc.Transform.PosX:+0.##;-0.##;0}")"
+                            OnChange="v => S.Edit.SetTransform(posX: v)" />
+                    <div class="pb-1 text-[10px] leading-[1.5] text-faint">@FrameHint</div>
                 </div>
-                <div>
+
+                <div class="mt-2 border-t border-line pt-3.5">
+                    <div class="pb-2.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">AUDIO</div>
+                    <Slider Label="Voice volume" Value="@doc.Audio.Voice" Min="0" Max="2" Step="0.05"
+                            Display="@($"{doc.Audio.Voice * 100:0}%")"
+                            OnChange="v => S.Edit.SetAudio(voice: v)" />
+                    @if (doc.Audio.Voice > 1.001)
+                    {
+                        <div class="-mt-1 pb-3 text-[10px] leading-[1.5] text-faint">Boost above 100% applies on export; the preview plays at 100%.</div>
+                    }
+                    <Slider Label="Music bed" Value="@doc.Audio.Music" Min="0" Max="1" Step="0.05"
+                            Display="@(doc.Audio.Music > 0.001 ? $"{doc.Audio.Music * 100:0}%" : "off")"
+                            OnChange="v => S.Edit.SetAudio(music: v)" />
+                </div>
+
+                <div class="mt-2 flex flex-col gap-3 border-t border-line pt-3.5">
+                    <div class="font-mono text-[9.5px] tracking-[0.1em] text-faint">CAPTIONS</div>
                     <div class="flex items-center justify-between text-xs">
-                        <span class="font-semibold @(S.CaptionsAvailableForFormat ? "text-soft" : "text-faint")">Captions</span>
-                        @if (S.CaptionsAvailableForFormat)
+                        <span class="font-semibold @(HasCaptions ? "text-soft" : "text-faint")">Burn in</span>
+                        @if (HasCaptions)
                         {
-                            <span @onclick="S.ToggleClipCaptions" class="relative h-[17px] w-[30px] cursor-pointer rounded-[9px] @(S.ClipCaptionsOn ? "bg-accent" : "bg-well")">
-                                <span class="absolute top-0.5 h-[13px] w-[13px] rounded-full @(S.ClipCaptionsOn ? "right-0.5 bg-ink" : "left-0.5 bg-muted")"></span>
+                            <span @onclick="() => S.Edit.SetCaptionsEnabled(!CaptionsOn)" title="Burn in"
+                                  class="relative h-[17px] w-[30px] cursor-pointer rounded-[9px] @(CaptionsOn ? "bg-accent" : "bg-well")">
+                                <span class="absolute top-0.5 h-[13px] w-[13px] rounded-full @(CaptionsOn ? "right-0.5 bg-ink" : "left-0.5 bg-muted")"></span>
                             </span>
                         }
                         else
@@ -130,25 +186,27 @@
                             </span>
                         }
                     </div>
-                    @if (!S.CaptionsAvailableForFormat)
+                    @if (!HasCaptions)
                     {
-                        <div class="mt-1 text-[10.5px] leading-[1.5] text-faint">@CaptionsHint</div>
+                        <div class="-mt-1 text-[10.5px] leading-[1.5] text-faint">No caption lines on this cut — the transcript had no words in its window.</div>
+                    }
+                    else
+                    {
+                        <div class="flex items-center justify-between text-xs">
+                            <span class="font-semibold text-soft">Style</span>
+                            <span class="flex overflow-hidden rounded border border-line2">
+                                @foreach (var (key, label) in CaptionStyleOptions)
+                                {
+                                    <span @onclick="() => PickStyle(key)" title="@label"
+                                          class="cursor-pointer px-[8px] py-[3px] @(key != CaptionStyleOptions[0].Key ? "border-l border-line2" : "") @(doc.CaptionStyle == key ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">@label</span>
+                                }
+                            </span>
+                        </div>
                     }
                 </div>
-                <div class="flex items-center justify-between text-xs">
-                    <span class="font-semibold text-soft">Reframe</span>
-                    <span class="flex overflow-hidden rounded border border-line2">
-                        <span @onclick='() => S.Edit.SetReframe("auto")' class="cursor-pointer px-[9px] py-[3px] @(S.Edit.Doc?.Reframe != "manual" ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">Auto</span>
-                        <span @onclick='() => S.Edit.SetReframe("manual")' class="cursor-pointer border-l border-line2 px-[9px] py-[3px] @(S.Edit.Doc?.Reframe == "manual" ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">Manual</span>
-                    </span>
-                </div>
-                <div class="flex items-center justify-between text-xs">
-                    <span class="font-semibold text-soft">Snap to grid</span>
-                    <span @onclick="S.ToggleSnap" class="relative h-[17px] w-[30px] cursor-pointer rounded-[9px] @(S.Snap ? "bg-accent" : "bg-well")">
-                        <span class="absolute top-0.5 h-[13px] w-[13px] rounded-full @(S.Snap ? "right-0.5 bg-ink" : "left-0.5 bg-muted")"></span>
-                    </span>
-                </div>
-            </div>
+                @* Snap lives on the timeline toolbar, where it applies — a
+                   second copy here was the same switch twice. *@
+            }
         </div>
     }
 
@@ -189,9 +247,31 @@
 @code {
     bool AgentAvailable => S.ActiveClip is null; // long-form editor only
 
-    string CaptionsHint => S.ClipFormat == "wide"
-        ? "The wide 16:9 ships clean — captions are burned on the vertical and square renders."
-        : "Captions weren't rendered for this clip.";
+    static readonly (string Key, string Label)[] FormatOptions =
+        [("vertical", "9:16"), ("square", "1:1"), ("wide", "16:9")];
+
+    static readonly (string Key, string Label)[] CaptionStyleOptions =
+        [("boxed", "Boxed"), ("plain", "Plain"), ("karaoke", "Karaoke")];
+
+    string CurrentFormat => S.Edit.Doc?.Format ?? "source";
+    bool HasCaptions => S.Edit.Doc is { Captions.Count: > 0 };
+    bool CaptionsOn => S.Edit.Doc?.CaptionsEnabled ?? true;
+
+    /// <summary>At the source aspect there is no crop window to slide until
+    /// zoom opens one — say so instead of letting Position X look broken.</summary>
+    string FrameHint => S.Edit.Doc switch
+    {
+        { Reframe: "manual", Format: "source" or null } d when d.Transform.Scale <= 1.001 =>
+            "Position needs zoom above 1× at the source aspect.",
+        { Reframe: "manual" } => "Manual crops into the frame — zoom and position pick the window.",
+        _ => "Auto fits the whole frame and blurs the margins. Dragging zoom or position switches to manual.",
+    };
+
+    void PickStyle(string style)
+    {
+        S.SetCapStyle(style);            // preview fallback outside the editor
+        S.Edit.SetCaptionStyle(style);
+    }
 
     async Task OpenPanel(string key)
     {

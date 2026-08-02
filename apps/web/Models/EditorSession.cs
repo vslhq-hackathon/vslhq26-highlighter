@@ -17,6 +17,7 @@ public sealed class EditorSession(ApiClient api, Action notify)
     private readonly List<string> _redo = [];
     private Timer? _saveTimer;
     private Guid _loadToken;
+    private string? _openSnapshot;
 
     public EditorDocResponse? Meta { get; private set; }
     public EditorDoc? Doc { get; private set; }
@@ -38,6 +39,18 @@ public sealed class EditorSession(ApiClient api, Action notify)
 
     public bool CanUndo => _undo.Count > 0;
     public bool CanRedo => _redo.Count > 0;
+
+    /// <summary>Bumped on every document change. The program monitor pushes
+    /// caption data across the JS boundary only when this moves, instead of on
+    /// every playhead tick.</summary>
+    public int DocRevision { get; private set; }
+
+    /// <summary>Whether the cut currently DIFFERS from how the editor found it.
+    /// Autosave means "unsaved" is usually false even after real edits, so the
+    /// close prompt asks this instead — and Discard has an open-time snapshot
+    /// to roll back to. Recomputed against that snapshot on every change, so
+    /// undoing back to the original state clears it.</summary>
+    public bool ChangedSinceOpen { get; private set; }
     public double OutputDuration => Doc is null ? 0 : Doc.Segments.Sum(s => (s.SrcEnd - s.SrcStart) / s.Speed);
     public double PlayheadOutput => Doc is null ? 0 : OutputAt(Playhead);
 
@@ -66,6 +79,7 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public EdlSegment? SelectedSegment => Doc?.Segments.FirstOrDefault(s => s.Id == SelectedId);
     public EdlCaption? SelectedCaption => Doc?.Captions.FirstOrDefault(c => c.Id == SelectedId);
     public EdlText? SelectedText => Doc?.Texts.FirstOrDefault(t => t.Id == SelectedId);
+    public EdlMarker? SelectedMarker => Doc?.Markers.FirstOrDefault(m => m.Id == SelectedId);
 
     // ---- lifecycle ------------------------------------------------------- //
 
@@ -87,6 +101,8 @@ public sealed class EditorSession(ApiClient api, Action notify)
         Playhead = 0;
         _undo.Clear();
         _redo.Clear();
+        _openSnapshot = null;
+        ChangedSinceOpen = false;
         notify();
         try
         {
@@ -94,6 +110,8 @@ public sealed class EditorSession(ApiClient api, Action notify)
             if (_loadToken != token) return;
             Meta = NormalizeMeta(response, fallbackDuration);
             Doc = Meta.Doc;
+            _openSnapshot = JsonSerializer.Serialize(Doc, Json);
+            DocRevision++;
             SaveState = "Saved";
             FitZoom();
         }
@@ -155,12 +173,35 @@ public sealed class EditorSession(ApiClient api, Action notify)
         return response with { Doc = doc };
     }
 
+    /// <summary>Tear down the session. The caller decides what happens to
+    /// pending changes first (StudioState prompts) — flushing here would race
+    /// the token rotation below and drop the result on the floor.</summary>
     public void Close()
     {
-        _ = FlushSaveAsync();
         _saveTimer?.Dispose();
         _saveTimer = null;
         _loadToken = Guid.NewGuid();
+        _openSnapshot = null;
+        ChangedSinceOpen = false;
+    }
+
+    /// <summary>Put the cut back exactly as the editor found it and persist
+    /// that — autosave has usually already written the edits, so discarding
+    /// has to be a real write, not just dropping local state.</summary>
+    public async Task DiscardChangesAsync()
+    {
+        if (_openSnapshot is null) return;
+        if (JsonSerializer.Deserialize<EditorDoc>(_openSnapshot, Json) is not { } restored) return;
+        _saveTimer?.Dispose();
+        _saveTimer = null;
+        Doc = restored;
+        _undo.Clear();
+        _redo.Clear();
+        SaveState = "Unsaved";
+        ChangedSinceOpen = false;
+        DocRevision++;
+        notify();
+        await FlushSaveAsync();
     }
 
     // ---- time mapping (output-time timeline over a source-time doc) ------- //
@@ -541,8 +582,46 @@ public sealed class EditorSession(ApiClient api, Action notify)
 
     public void UpdateCaptionText(string id, string text) => Apply(doc => doc with
     {
-        Captions = doc.Captions.Select(c => c.Id == id ? c with { Text = text } : c).ToList(),
+        Captions = doc.Captions
+            .Select(c => c.Id == id ? c with { Text = text, Words = Retime(c, text) } : c)
+            .ToList(),
     }, coalesceKey: $"caption:{id}");
+
+    /// <summary>Keep a caption's word timings usable after its text is edited —
+    /// karaoke sweeps the word list, so leaving it stale makes the preview and
+    /// the export highlight words that are no longer there. A same-length edit
+    /// (the typo fix) keeps the real speech timings; anything else re-spreads
+    /// the line's own window across the new words by their length.</summary>
+    private static List<EdlWord>? Retime(EdlCaption caption, string text)
+    {
+        if (caption.Words is null or { Count: 0 }) return null;
+        var tokens = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length == 0) return null;
+        if (tokens.Length == caption.Words.Count)
+            return caption.Words.Select((w, i) => w with { T = tokens[i] }).ToList();
+
+        var weights = tokens.Select(token => (double)token.Length + 1).ToArray();
+        var total = weights.Sum();
+        var span = Math.Max(0.001, caption.End - caption.Start);
+        var words = new List<EdlWord>(tokens.Length);
+        var at = caption.Start;
+        for (var i = 0; i < tokens.Length; i++)
+        {
+            var width = span * weights[i] / total;
+            words.Add(new EdlWord(tokens[i], Math.Round(at, 3), Math.Round(at + width, 3)));
+            at += width;
+        }
+        return words;
+    }
+
+    /// <summary>Markers are notes to yourself; "M3" is only useful if you can
+    /// say what M3 is.</summary>
+    public void UpdateMarkerLabel(string id, string label) => Apply(doc => doc with
+    {
+        Markers = doc.Markers
+            .Select(m => m.Id == id ? m with { Label = label } : m)
+            .ToList(),
+    }, coalesceKey: $"marker:{id}");
 
     public void UpdateTextOverlay(string id, string? text = null, double? y = null) => Apply(doc => doc with
     {
@@ -582,11 +661,21 @@ public sealed class EditorSession(ApiClient api, Action notify)
 
     public void SetReframe(string reframe) => Apply(doc => doc with { Reframe = reframe });
 
+    /// <summary>Delivery aspect: "vertical" | "square" | "wide" | "source".</summary>
+    public void SetFormat(string format) => Apply(doc => doc with { Format = format });
+
+    public void SetCaptionsEnabled(bool enabled) =>
+        Apply(doc => doc with { CaptionsEnabled = enabled });
+
+    /// <summary>Zoom/pan are the manual reframe's controls, so touching either
+    /// switches reframe to manual — otherwise the sliders move a number that
+    /// nothing reads, which is exactly how they used to look broken.</summary>
     public void SetTransform(double? scale = null, double? posX = null) => Apply(doc => doc with
     {
         Transform = new EdlTransform(
             Math.Clamp(scale ?? doc.Transform.Scale, 1, 3),
             Math.Clamp(posX ?? doc.Transform.PosX, -1, 1)),
+        Reframe = "manual",
     }, coalesceKey: "transform");
 
     public void SetAudio(double? voice = null, double? music = null) => Apply(doc => doc with
@@ -638,14 +727,33 @@ public sealed class EditorSession(ApiClient api, Action notify)
     private void MarkDirty()
     {
         SaveState = "Unsaved";
+        // Compare, don't latch: undoing back to the opening state has to stop
+        // claiming there are changes to save. Apply() already serializes the
+        // doc for the undo stack, so this costs nothing new.
+        ChangedSinceOpen = _openSnapshot is null
+            || JsonSerializer.Serialize(Doc, Json) != _openSnapshot;
+        DocRevision++;
         _saveTimer?.Dispose();
         _saveTimer = new Timer(_ => _ = FlushSaveAsync(), null,
             TimeSpan.FromSeconds(1.5), Timeout.InfiniteTimeSpan);
     }
 
-    public async Task FlushSaveAsync()
+    /// <summary>Persist the doc. commit=true is an explicit Save (the button):
+    /// it also moves the "how the editor found it" baseline forward, so closing
+    /// right after saving doesn't prompt. Autosave never commits — that would
+    /// quietly destroy what Discard rolls back to.</summary>
+    public async Task FlushSaveAsync(bool commit = false)
     {
-        if (Doc is null || Meta is null || SaveState is "Saved" or "Saving…") return;
+        if (Doc is null || Meta is null || SaveState is "Saved" or "Saving…")
+        {
+            if (commit && Doc is not null && SaveState == "Saved")
+            {
+                _openSnapshot = JsonSerializer.Serialize(Doc, Json);
+                ChangedSinceOpen = false;
+                notify();
+            }
+            return;
+        }
         var token = _loadToken;
         var clipId = Meta.ClipId;
         var doc = Doc;
@@ -659,6 +767,11 @@ public sealed class EditorSession(ApiClient api, Action notify)
             if (_loadToken != token || Meta is null) return;
             Meta = response with { Doc = Meta.Doc };
             SaveState = "Saved";
+            if (commit)
+            {
+                _openSnapshot = JsonSerializer.Serialize(doc, Json);
+                ChangedSinceOpen = false;
+            }
         }
         catch (ApiException exception)
         {

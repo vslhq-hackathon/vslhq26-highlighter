@@ -62,7 +62,7 @@
                             }
                         </div>
                         <div class="px-3.5 pb-3.5 pt-[13px]">
-                            <div class="truncate text-[13.5px] font-semibold leading-[1.35]" title="@p.Name">@p.Name</div>
+                            <div class="break-words text-[13.5px] font-semibold leading-[1.35]">@Fmt.Title(p.Name)</div>
                             <div class="mt-[9px] flex items-center gap-2 text-[11.5px] text-muted">
                                 <span class="rounded-[3px] border border-line2 px-[5px] py-px font-mono text-[10px] text-muted">@Fmt.Kind(p.SourceType)</span>
                                 <span class="truncate">@Fmt.Outputs(p.Pipeline)</span>

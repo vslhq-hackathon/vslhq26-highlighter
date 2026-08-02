@@ -1,27 +1,18 @@
 @inherits StudioComponent
+@inject IJSRuntime JS
+@implements IAsyncDisposable
 
 <div class="flex-1 overflow-y-auto" data-screen-label="Project">
     <div class="mx-auto max-w-[1080px] px-10 pb-12 pt-[30px]">
         <div class="anim-fade-up flex items-baseline gap-[14px]">
-            <div class="min-w-0 truncate text-[22px] font-bold tracking-[-0.01em]">@S.ProjectTitle</div>
+            <div class="min-w-0 break-words text-[22px] font-bold tracking-[-0.01em]">@Fmt.Title(S.ProjectTitle)</div>
             @if (S.Project is { } p)
             {
                 <div class="shrink-0 text-[12.5px] text-muted">@Fmt.Kind(p.SourceType) · @Fmt.Duration(p.DurationSeconds) · @Fmt.Added(p.CreatedAt)</div>
             }
             <div class="ml-auto shrink-0">
-                @if (!_confirmProjectDelete)
-                {
-                    <div @onclick="() => _confirmProjectDelete = true"
-                         class="cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-muted hover:border-playhead/50 hover:text-playhead">Delete project</div>
-                }
-                else
-                {
-                    <div class="flex items-center gap-2 text-xs">
-                        <span class="text-soft">Delete this project and all its media?</span>
-                        <span @onclick="DeleteProject" class="cursor-pointer rounded-[5px] bg-playhead/80 px-3 py-[5px] font-bold text-ink hover:bg-playhead @(S.DeleteBusy ? "pointer-events-none opacity-60" : "")">@(S.DeleteBusy ? "Deleting…" : "Delete")</span>
-                        <span @onclick="() => _confirmProjectDelete = false" class="cursor-pointer px-1.5 text-muted hover:text-fg">Keep</span>
-                    </div>
-                }
+                <div @onclick="() => _confirmProjectDelete = true"
+                     class="cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-muted hover:border-playhead/50 hover:text-playhead">Delete project</div>
             </div>
         </div>
 
@@ -66,7 +57,7 @@
                     <div class="w-[46%] shrink-0">
                         @if (S.LatestLongform is { VideoUrl: { } videoUrl } cut)
                         {
-                            <video controls preload="metadata" playsinline src="@videoUrl"
+                            <video @ref="_cutVideo" controls preload="metadata" playsinline src="@videoUrl"
                                    poster="@cut.ThumbnailUrl"
                                    class="aspect-video w-full rounded-[5px] bg-black"></video>
                         }
@@ -77,7 +68,7 @@
                                 {
                                     <span class="flex items-center gap-2 font-mono text-[10.5px] text-accent">
                                         <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span>
-                                        @Fmt.StatusLine(processing) — stitching the cut
+                                        @Fmt.StatusLine(processing)
                                     </span>
                                 }
                                 else
@@ -87,12 +78,17 @@
                             </div>
                         }
                         <div class="mt-3 flex items-center gap-2">
-                            <div class="min-w-0 truncate text-sm font-bold" title="@S.LongformTitle">@S.LongformTitle</div>
+                            <div class="min-w-0 break-words text-sm font-bold">@Fmt.Title(S.LongformTitle)</div>
                             @if (S.LatestLongform is { } lf)
                             {
                                 <div class="shrink-0 text-[11.5px] text-muted">v@(lf.Version) · @Fmt.Duration(lf.DurationSeconds)</div>
                                 <div @onclick="S.OpenEditorLong" class="ml-auto shrink-0 cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Open in editor</div>
-                                <div @onclick="() => S.OpenPublish(null)" class="shrink-0 cursor-pointer rounded-[5px] bg-accent px-3 py-[5px] text-xs font-bold text-ink hover:bg-accent-soft active:scale-[0.98]">Publish</div>
+                                @* Publishing runs a worker against the run
+                                   mirror; without it the API 409s on click. *@
+                                <span class="shrink-0" title="@(S.WorkerActionsAvailable ? null : "This project's run files aren't on this machine")">
+                                    <div @onclick="() => S.OpenPublish(null)"
+                                         class="cursor-pointer rounded-[5px] bg-accent px-3 py-[5px] text-xs font-bold text-ink hover:bg-accent-soft active:scale-[0.98] @(S.WorkerActionsAvailable ? "" : "pointer-events-none opacity-40")">Publish</div>
+                                </span>
                             }
                         </div>
                     </div>
@@ -106,9 +102,10 @@
                             }
                             @foreach (var (seg, i) in Segments.Select((s, i) => (s, i)))
                             {
-                                <div class="flex cursor-pointer items-center gap-3 rounded-[5px] px-2.5 py-2 hover:bg-elevate">
-                                    <span class="w-[48px] shrink-0 font-mono text-[10.5px] text-faint">@Fmt.Stamp(seg.StartSeconds)</span>
-                                    <span class="flex-1 truncate text-[12.5px] text-soft">@(seg.Title ?? $"Segment {i + 1}")</span>
+                                <div @onclick="() => SeekToSegment(i)" title="Jump to this segment"
+                                     class="flex cursor-pointer items-center gap-3 rounded-[5px] px-2.5 py-2 hover:bg-elevate">
+                                    <span class="w-[48px] shrink-0 font-mono text-[10.5px] text-faint">@Fmt.Stamp(CutOffset(i))</span>
+                                    <span class="min-w-0 flex-1 break-words text-[12.5px] text-soft">@(seg.Title is { } segTitle ? Fmt.Title(segTitle) : $"Segment {i + 1}")</span>
                                     <span class="shrink-0 font-mono text-[10px] text-faint">@Fmt.Duration(seg.EndSeconds - seg.StartSeconds)</span>
                                 </div>
                             }
@@ -127,7 +124,16 @@
             {
                 <div class="anim-fade-up mb-3.5 mt-8 flex items-center gap-[14px]" style="animation-delay:90ms">
                     <div class="text-[15.5px] font-bold">Highlights</div>
-                    <div class="text-[12.5px] text-muted">@Fmt.Count(S.Detail.Clips.Count, "highlight")</div>
+                    <div class="text-[12.5px] text-muted">
+                        @if (S.SearchActive)
+                        {
+                            @($"{S.VisibleClips.Count()} of {S.Detail.Clips.Count} match")
+                        }
+                        else
+                        {
+                            @Fmt.Count(S.Detail.Clips.Count, "highlight")
+                        }
+                    </div>
                     @if (S.Project is { Processing: true })
                     {
                         <span class="flex items-center gap-[5px] text-[11.5px] text-accent">
@@ -148,7 +154,7 @@
                     </div>
                 </div>
                 <div class="grid grid-cols-4 gap-[14px]">
-                    @foreach (var (clip, pos) in S.SortedClips.Select((c, pos) => (c, pos)))
+                    @foreach (var (clip, pos) in S.VisibleClips.Select((c, pos) => (c, pos)))
                     {
                         <div @onclick="() => S.OpenClip(clip)" class="anim-fade-up group cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(120 + 30 * Math.Min(pos, 8))ms">
                             <div class="relative flex aspect-[9/12] items-center justify-center overflow-hidden bg-[repeating-linear-gradient(-45deg,#1C1B19_0_10px,#201E1C_10px_20px)]">
@@ -166,31 +172,22 @@
                                     <span class="font-mono text-[10px] text-dim">@(clip.Status == "rendered" ? "highlight frame" : "rendering…")</span>
                                 }
                                 <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">@Fmt.Duration(clip.DurationSeconds)</span>
-                                @if (_confirmClipDelete == clip.Id)
-                                {
-                                    <div @onclick:stopPropagation class="absolute inset-x-0 top-0 flex items-center justify-between gap-1 bg-[rgba(20,19,18,0.92)] px-2 py-1.5 text-[10.5px]">
-                                        <span class="text-soft">Delete this highlight?</span>
-                                        <span class="flex items-center gap-1.5">
-                                            <span @onclick="() => DeleteClip(clip)" class="cursor-pointer rounded bg-playhead/80 px-2 py-0.5 font-bold text-ink hover:bg-playhead @(S.DeleteBusy ? "pointer-events-none opacity-60" : "")">Yes</span>
-                                            <span @onclick="() => _confirmClipDelete = null" class="cursor-pointer px-1 text-muted hover:text-fg">No</span>
-                                        </span>
-                                    </div>
-                                }
-                                else
-                                {
-                                    <span @onclick="() => _confirmClipDelete = clip.Id" @onclick:stopPropagation
-                                          title="Delete this highlight"
-                                          class="absolute right-1.5 top-1.5 hidden h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-full bg-[rgba(20,19,18,0.85)] text-[11px] text-muted hover:text-playhead group-hover:flex">✕</span>
-                                }
+                                <span @onclick="() => _confirmClipDelete = clip" @onclick:stopPropagation
+                                      title="Delete"
+                                      class="absolute right-1.5 top-1.5 hidden h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-full bg-[rgba(20,19,18,0.85)] text-[11px] text-muted hover:text-playhead group-hover:flex">✕</span>
                             </div>
                             <div class="flex items-start gap-[9px] px-3 pb-3 pt-[11px]">
                                 <span title="Content score" class="mt-px flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full bg-accent font-mono text-[9.5px] font-medium leading-none text-ink" style="opacity:@Fmt.ScoreOpacity(clip.Score)">@Fmt.Score100(clip.Score)</span>
-                                <div class="text-[13px] font-semibold leading-[1.35]">@clip.Title</div>
+                                <div class="text-[13px] font-semibold leading-[1.35]">@Fmt.Title(clip.Title)</div>
                             </div>
                         </div>
                     }
                 </div>
-                @if (S.Detail.Clips.Count == 0 && S.Project is { Processing: false })
+                @if (S.Detail.Clips.Count > 0 && !S.VisibleClips.Any())
+                {
+                    <div class="anim-fade-up mt-2 text-[12.5px] text-muted">No highlights match “@S.Search.Trim()”.</div>
+                }
+                else if (S.Detail.Clips.Count == 0 && S.Project is { Processing: false })
                 {
                     <div class="anim-fade-up mt-2 text-[12.5px] text-muted">No highlight clips were produced for this run.</div>
                 }
@@ -199,23 +196,89 @@
     </div>
 </div>
 
+@if (_confirmProjectDelete)
+{
+    <ConfirmModal Title="Delete this project?"
+                  Detail="@($"“{S.ProjectTitle}”, its highlights and every rendered file will be permanently deleted.")"
+                  Error="@S.DeleteError" ShowClose="false"
+                  ConfirmLabel="Delete" BusyLabel="Deleting…" Danger="true" Busy="S.DeleteBusy"
+                  SecondaryLabel="Cancel"
+                  OnConfirm="DeleteProject"
+                  OnSecondary="() => _confirmProjectDelete = false"
+                  OnCancel="() => _confirmProjectDelete = false" />
+}
+@if (_confirmClipDelete is { } pendingClip)
+{
+    <ConfirmModal Title="Delete this highlight?"
+                  Detail="@($"“{Fmt.Title(pendingClip.Title)}” and its renders will be permanently deleted.")"
+                  Error="@S.DeleteError" ShowClose="false"
+                  ConfirmLabel="Delete" BusyLabel="Deleting…" Danger="true" Busy="S.DeleteBusy"
+                  SecondaryLabel="Cancel"
+                  OnConfirm="() => DeleteClip(pendingClip)"
+                  OnSecondary="() => _confirmClipDelete = null"
+                  OnCancel="() => _confirmClipDelete = null" />
+}
+
 @code {
     bool _confirmProjectDelete;
-    Guid? _confirmClipDelete;
+    ClipDto? _confirmClipDelete;
+    ElementReference _cutVideo;
+    IJSObjectReference? _module;
 
     bool ShowLongform => S.Project?.Pipeline is "long" or "both" || (S.Detail?.LongformEdits.Count ?? 0) > 0;
     bool ShowShorts => S.Project?.Pipeline is "short" or "both" || (S.Detail?.Clips.Count ?? 0) > 0;
     List<LongformSegmentDto> Segments => (S.LatestLongform?.Segments ?? []).ToList();
 
+    /// <summary>Where a segment sits IN THE CUT. Segment rows carry the SOURCE
+    /// window they were lifted from, but the stitched video plays the kept
+    /// segments back to back — listing source timestamps is what made the last
+    /// segment of a 9:50 cut claim it starts at 9:45.</summary>
+    double CutOffset(int index) =>
+        Segments.Take(index).Sum(s => Math.Max(0, s.EndSeconds - s.StartSeconds));
+
+    /// <summary>Jump the cut player to a segment, staying paused.</summary>
+    async Task SeekToSegment(int index)
+    {
+        if (S.LatestLongform?.VideoUrl is null) return;
+        var offset = CutOffset(index);
+        try
+        {
+            _module ??= await JS.InvokeAsync<IJSObjectReference>("import", "./js/studio.js");
+            // studio.js seek() never calls play(), so the video stays paused.
+            await _module.InvokeVoidAsync("seek", _cutVideo, offset);
+        }
+        catch (Exception exception) when (exception
+            is JSDisconnectedException or JSException
+            or ObjectDisposedException or TaskCanceledException)
+        {
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Dispose(); // StudioComponent's Changed unsubscribe
+        if (_module is null) return;
+        try
+        {
+            await _module.DisposeAsync();
+        }
+        catch (Exception exception) when (exception
+            is JSDisconnectedException or JSException or ObjectDisposedException)
+        {
+        }
+    }
+
+    // A failure keeps the dialog open with the reason on it; the banner behind
+    // it would otherwise be covered by the backdrop.
     async Task DeleteProject()
     {
         await S.DeleteProjectAsync();
-        _confirmProjectDelete = false;
+        if (S.DeleteError is null) _confirmProjectDelete = false;
     }
 
     async Task DeleteClip(ClipDto clip)
     {
         await S.DeleteClipAsync(clip);
-        _confirmClipDelete = null;
+        if (S.DeleteError is null) _confirmClipDelete = null;
     }
 }

@@ -33,8 +33,11 @@ public record LongformEditDto(
 
 /// <summary>A generated long-form thumbnail concept (metadata.render.thumbnails).
 /// Index is the variant's stable number; SelectedThumbnail on the edit points at
-/// the Index currently set as the video's thumbnail.</summary>
-public record ThumbnailVariantDto(int Index, string? Direction, string? OverlayText, string? Url);
+/// the Index currently set as the video's thumbnail. Error is set (and Url null)
+/// when the image model failed for that concept — the slot is kept so the studio
+/// can show and retry it instead of silently skipping a number.</summary>
+public record ThumbnailVariantDto(
+    int Index, string? Direction, string? OverlayText, string? Url, string? Error = null);
 
 public record LongformSegmentDto(
     int? ChunkIndex, string? Title, double StartSeconds, double EndSeconds);
